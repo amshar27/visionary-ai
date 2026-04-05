@@ -1,0 +1,30 @@
+# Environment files — NEVER commit these
+.env
+backend/.env
+frontend-react/.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# AI model weights (too large for GitHub)
+backend/model/*.pth
+
+# Node
+frontend-react/node_modules/
+node_modules/
+
+# Vite build output
+frontend-react/dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
