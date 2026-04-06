@@ -111,18 +111,18 @@ function EyePanel({
           {result && (
             <div className="space-y-1 text-sm text-gray-600">
               <p><span className="font-semibold text-gray-900">Disease Detected:</span> {result.disease_detected === true ? 'Yes' : result.disease_detected === false ? 'No' : 'Unknown'}</p>
-              <p><span className="font-semibold text-gray-900">Disease Type:</span> {result.disease_type ?? 'Not specified'}</p>
-              <p><span className="font-semibold text-gray-900">Severity:</span> {result.severity_label ?? result.dr_severity ?? 'Not specified'}</p>
+              <p><span className="font-semibold text-gray-900">Disease Type:</span> {result.disease_type ?? ({'cataract': 'Cataract', 'glaucoma': 'Glaucoma', 'none': 'No Disease Detected', 'mild': 'Diabetic Retinopathy', 'moderate': 'Diabetic Retinopathy', 'severe': 'Diabetic Retinopathy', 'proliferative': 'Diabetic Retinopathy'} as Record<string, string>)[result.dr_severity?.toLowerCase()] ?? 'Not specified'}</p>
+              <p><span className="font-semibold text-gray-900">Severity:</span> {['cataract', 'glaucoma'].includes(result.dr_severity?.toLowerCase()) ? 'N/A' : (result.severity_label ?? result.dr_severity ?? 'Not specified')}</p>
               <p><span className="font-semibold text-gray-900">Referable:</span> {String(result.referable)}</p>
               <p><span className="font-semibold text-gray-900">Confidence:</span> {fmtConfidence(result.confidence_score)}</p>
               <p><span className="font-semibold text-gray-900">Follow-up:</span> {result.follow_up_interval ?? '-'}</p>
               {result.llm_summary && (
                 <div className="mt-2 p-2 rounded-lg text-xs" style={{ background: '#f9fafb', border: '1px solid #e5e7eb', boxShadow: '0 2px 8px rgba(0,0,0,0.07)' }}>
-                  <p className="font-semibold text-gray-900 mb-1">LLM Summary:</p>
+                  <p className="font-semibold text-gray-900 mb-1">AI Analysis:</p>
                   <p className="text-gray-600">{result.llm_summary}</p>
                 </div>
               )}
-              {result.warnings?.length > 0 && (
+              {result.warnings?.length > 0 && !['cataract', 'glaucoma'].includes(result.dr_severity?.toLowerCase()) && (
                 <div className="mt-1">
                   <p className="font-semibold text-yellow-600 text-xs">Warnings:</p>
                   {result.warnings.map((w, i) => (

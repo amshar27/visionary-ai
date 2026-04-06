@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from supabase import create_client
+from supabase import create_client, ClientOptions
 
 # Load .env from project root
 load_dotenv()
@@ -13,5 +13,6 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 
 supabase = create_client(
     SUPABASE_URL,
-    SUPABASE_SERVICE_ROLE_KEY
+    SUPABASE_SERVICE_ROLE_KEY,
+    options=ClientOptions(storage_client_timeout=120),
 )

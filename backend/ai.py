@@ -27,6 +27,9 @@ from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy, context_precision
+from datasets import Dataset
 
 
 client = OpenAI()      
@@ -50,16 +53,21 @@ LOCKED_STATUSES = {"assigned", "approved", "overridden"}
 # ======================================================
 # MODEL CONFIGURATION
 # ======================================================
-NUM_CLASSES = 5
+NUM_CLASSES = 7  # Updated from 5 to 7
 ATTENTION_DIM = 512
 NUM_HEADS = 8
-CLASSES = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative DR']
-DR_SEVERITY_MAP = {
+# Updated classes array to match your training script exactly
+CLASSES = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative DR', 'Cataract', 'Glaucoma']
+
+# Renamed slightly for clarity, but keeping the dictionary keys mapped to the classes
+DISEASE_SEVERITY_MAP = {
     'No DR': 'none',
     'Mild': 'mild',
     'Moderate': 'moderate',
     'Severe': 'severe',
-    'Proliferative DR': 'proliferative'
+    'Proliferative DR': 'proliferative',
+    'Cataract': 'cataract',  # New mapping
+    'Glaucoma': 'glaucoma'   # New mapping
 }
 
 # Device configuration
@@ -127,7 +135,7 @@ def download_image_from_supabase(image_url: str) -> Image.Image:
     Download image from Supabase Storage URL and return PIL Image.
     """
     try:
-        response = requests.get(image_url, timeout=10)
+        response = requests.get(image_url, timeout=30)
         response.raise_for_status()
         image = Image.open(io.BytesIO(response.content)).convert('RGB')
         return image
@@ -152,8 +160,9 @@ def predict_image(image: Image.Image) -> Dict:
             probabilities = torch.nn.functional.softmax(outputs, dim=1)
             confidence, predicted = torch.max(probabilities, 1)
         
-        # Extract results
-        predicted_class = CLASSES[predicted.item()]
+       # Extract results
+        predicted_idx = predicted.item()
+        predicted_class = CLASSES[predicted_idx]
         confidence_score = float(confidence.item())
         
         # Get all class probabilities
@@ -162,12 +171,12 @@ def predict_image(image: Image.Image) -> Dict:
             for i in range(NUM_CLASSES)
         }
         
-        # Determine DR presence and referability
-        dr_presence = predicted.item() > 0  # Any class > "No DR"
-        referable = predicted.item() >= 2  # Moderate or worse
+        # Determine disease presence and referability
+        dr_presence = predicted_idx > 0  # True if NOT 'No DR'
+        referable = predicted_idx >= 2   # Moderate DR, Severe, Proliferative, Cataract, and Glaucoma all require referral
         
-        # Map to your database severity format
-        dr_severity = DR_SEVERITY_MAP[predicted_class]
+        # Map to your database severity format (keeping variable name dr_severity so DB doesn't break)
+        dr_severity = DISEASE_SEVERITY_MAP[predicted_class]
         
         # Determine follow-up interval based on severity
         follow_up_map = {
@@ -175,16 +184,24 @@ def predict_image(image: Image.Image) -> Dict:
             'mild': '12 months',
             'moderate': '6 months',
             'severe': '3 months',
-            'proliferative': '1 month'
+            'proliferative': '1 month',
+            'cataract': 'Refer to specialist for evaluation',
+            'glaucoma': 'Urgent specialist referral'
         }
-        follow_up_interval = follow_up_map[dr_severity]
+        follow_up_interval = follow_up_map.get(dr_severity, 'TBD')
         
-        # Generate warnings based on severity
+        # Generate warnings based on specific diseases
         warnings = []
         if referable:
-            warnings.append("Referable diabetic retinopathy detected - urgent ophthalmology referral recommended")
-        if predicted.item() == 4:  # Proliferative DR
+            warnings.append(f"Referable condition detected ({predicted_class}) - specialist referral recommended")
+        
+        if predicted_idx == 4:  # Proliferative DR
             warnings.append("Proliferative diabetic retinopathy - immediate referral required")
+        elif predicted_idx == 5: # Cataract
+            warnings.append("Cataract detected - comprehensive eye exam recommended")
+        elif predicted_idx == 6: # Glaucoma
+            warnings.append("Glaucoma suspect - urgent visual field and IOP testing recommended")
+            
         if confidence_score < 0.7:
             warnings.append("Low confidence prediction - manual review recommended")
         
@@ -232,7 +249,7 @@ def generate_summary(predicted_class: str, confidence: float, dr_presence: bool,
                 {"role": "user", "content": user_msg}
             ],
             temperature=0.3,
-            max_tokens=60
+            max_tokens=200
         )
         
         return response.choices[0].message.content.strip()
@@ -250,7 +267,7 @@ def generate_heatmap(image_tensor, original_image_pil, predicted_class_idx):
         # 1. Select the target layer (Last convolutional layer of ResNet backbone)
         # In your ResNetWithAttention, self.backbone is a Sequential model.
         # We target the last layer of that sequence.
-        target_layers = [model.backbone[-1]]
+        target_layers = [model.backbone[-1][-1]]
 
         # 2. Initialize GradCAM
         cam = GradCAM(model=model, target_layers=target_layers)
@@ -548,7 +565,7 @@ def get_rag_summary(session_id: UUID):
 
 
 @router.post("/ingest-research")
-def ingest_research_papers(bucket_name: str = "research_papers"):
+def ingest_research_papers(bucket_name: str = "guidelines"):
     """
     Downloads PDFs from Supabase Storage, splits them, and indexes them in Vector DB.
     """
@@ -657,7 +674,7 @@ def generate_rag_summary(screening_session_id: UUID):
         # --- STEP 2: FETCH PATIENT DETAILS ---
         patient_res = (
             supabase.table("patients")
-            .select("name, age, diabetes_known, diabetes_type, diabetes_duration_years, comorbidities, notes")
+            .select("name, age, diabetes_known, diabetes_type, diabetes_duration_years, comorbidities, notes, family_history_glaucoma, elevated_iop, previous_eye_surgery, visual_symptoms")
             .eq("id", patient_id)
             .single()
             .execute()
@@ -677,6 +694,10 @@ def generate_rag_summary(screening_session_id: UUID):
         - Known Diabetic: {pt.get('diabetes_known', 'N/A')}
         - Type: {pt.get('diabetes_type', 'N/A')} ({pt.get('diabetes_duration_years', 0)} years)
         - Comorbidities: {comorbidities_str}
+        - Family History of Glaucoma: {pt.get('family_history_glaucoma', 'Unknown')}
+        - Previously Elevated IOP: {pt.get('elevated_iop', 'Unknown')}
+        - Previous Eye Surgery or Trauma: {pt.get('previous_eye_surgery', 'Unknown')}
+        - Visual Symptoms: {pt.get('visual_symptoms', 'None')}
         - Clinical Notes: {pt.get('notes', 'None')}
         """
 
@@ -731,22 +752,28 @@ def generate_rag_summary(screening_session_id: UUID):
                 worst_severity_score = current_score
                 worst_condition_name = severity
 
+            label = severity.capitalize() if severity.lower() in ['cataract', 'glaucoma'] else f"{severity.capitalize()} DR"
             diagnostic_lines.append(
-                f"- **{eye} Eye**: Prediction: {severity.capitalize()} DR | Confidence: {confidence:.1%}"
+                f"- **{eye} Eye**: Prediction: {label} | Confidence: {confidence:.1%}"
             )
         
         diagnostic_data_str = "\n".join(diagnostic_lines)
 
         # --- STEP 5: RAG RETRIEVAL ---
-        search_query = f"management and referral guidelines for {worst_condition_name} diabetic retinopathy Malaysia"
+        # Format the query based on whether it's DR or one of the new diseases
+        if worst_condition_name.lower() in ['cataract', 'glaucoma']:
+            search_query = f"management and referral guidelines for {worst_condition_name} Malaysia"
+        else:
+            search_query = f"management and referral guidelines for {worst_condition_name} diabetic retinopathy Malaysia"
+            
         query_vector = embeddings.embed_query(search_query)
         
         rpc_response = supabase.rpc(
             "match_documents",
             {
                 "query_embedding": query_vector,
-                "match_threshold": 0.5, 
-                "match_count": 3
+                "match_threshold": 0.45,
+                "match_count": 5
             }
         ).execute()
         
@@ -756,32 +783,59 @@ def generate_rag_summary(screening_session_id: UUID):
         else:
             context_text = "No specific local guidelines found in database."
 
-        # --- STEP 6: LLM GENERATION ---
+        # --- STEP 6a: LLM CALL 1 — Guideline Extractor (gpt-4o-mini) ---
+        logger.info("LLM Call 1: Extracting structured guidelines with gpt-4o-mini")
+        extraction_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a clinical guideline extraction assistant. Extract and condense the key actionable points from the provided guideline text into structured bullet points."
+                },
+                {
+                    "role": "user",
+                    "content": f"""From the following clinical guideline text for **{worst_condition_name}**, extract and condense into structured bullet points covering:
+- Recommended referral timeline
+- Key management steps
+- Urgent action triggers
+- Follow-up intervals
+
+Guideline text:
+{context_text}"""
+                }
+            ],
+            temperature=0.1,
+            max_tokens=1000,
+        )
+        extracted_guidelines = extraction_response.choices[0].message.content
+
+        # --- STEP 6b: LLM CALL 2 — Report Writer (gpt-4o) ---
+        logger.info("LLM Call 2: Generating full clinical report with gpt-4o")
         system_msg = "You are Visionary AI, a medical assistant. Use the provided context to generate a structured clinical summary. Use Markdown formatting."
-        
+
         user_msg = f"""
         **Target Audience:**
         You are writing this report for **{doctor_name}**.
-        
+
         **Patient Medical History:**
         {patient_history_str}
-        
+
         **Previous Screening History:**
         {past_history_str}
-        
+
         **Current Diagnostic Data (from CNN - {current_date}):**
         {diagnostic_data_str}
-        
+
         **Clinical Guidelines (Retrieved via RAG):**
-        {context_text}
-        
+        {extracted_guidelines}
+
         **Task:**
         Generate a report with exactly these headings:
         1. **Title**: Write exactly "### Clinical Summary for {doctor_name}"
-        2. **Diagnostic Summary**: State the AI finding clearly. Mention if condition has worsened.
-        3. **Patient Risk Profile**: Summarize diabetes history and comorbidities.
+        2. **Diagnostic Summary**: State the AI finding for each eye clearly. Compare with previous screening history and note if condition is new, stable, or worsened.
+        3. **Patient Risk Profile**: Summarize diabetes history, comorbidities, family history of glaucoma, IOP history, previous eye surgery, and visual symptoms. Highlight any risk factors relevant to {worst_condition_name}.
         4. **Key Clinical Features**: Describe typical retinal signs for {worst_condition_name}.
-        5. **Recommended Management**: Suggest referral timeline based on guidelines.
+        5. **Recommended Management**: Based on the retrieved guidelines, provide a specific referral timeline, management steps, and follow-up schedule tailored to this patient's risk profile.
         6. **Disclaimer**: Remind the user this is AI-assisted.
         """
 
@@ -806,7 +860,7 @@ def generate_rag_summary(screening_session_id: UUID):
             print(f"[ai.py] Failed to persist rag_summary: {save_err}")
 
         return {
-            "rag_summary": final_report,
+            "rag_summary": final_report, 
             "references": sources
         }
 
@@ -816,3 +870,101 @@ def generate_rag_summary(screening_session_id: UUID):
             "rag_summary": f"**Error generating report:** {str(e)}\n\nPlease review raw results manually.",
             "references": []
         }
+
+
+# ======================================================
+# RAG: EVALUATION ENDPOINT (RAGAS)
+# ======================================================
+@router.post("/evaluate-rag/{screening_session_id}")
+def evaluate_rag(screening_session_id: UUID):
+    """
+    Evaluates the existing RAG summary for a session using RAGAS metrics:
+    faithfulness, answer_relevancy, and context_precision.
+    """
+    try:
+        # --- STEP 1: Fetch existing RAG summary ---
+        ai_res = (
+            supabase.table("ai_results")
+            .select("*")
+            .eq("screening_session_id", str(screening_session_id))
+            .execute()
+        )
+
+        if not ai_res.data:
+            raise HTTPException(status_code=404, detail="No AI results found for this session.")
+
+        rag_summary = ai_res.data[0].get("rag_summary")
+        if not rag_summary:
+            raise HTTPException(status_code=404, detail="No RAG summary found. Generate one first via /summarise-rag.")
+
+        # --- STEP 2: Rebuild worst_condition_name from saved dr_severity ---
+        severity_levels = {'none': 0, 'mild': 1, 'moderate': 2, 'severe': 3, 'proliferative': 4}
+        worst_severity_score = -1
+        worst_condition_name = "No DR"
+
+        for result in ai_res.data:
+            severity = result['dr_severity']
+            current_score = severity_levels.get(severity.lower(), 0)
+            if current_score > worst_severity_score:
+                worst_severity_score = current_score
+                worst_condition_name = severity
+
+        # --- STEP 3: Rebuild search_query ---
+        if worst_condition_name.lower() in ['cataract', 'glaucoma']:
+            search_query = f"management and referral guidelines for {worst_condition_name} Malaysia"
+        else:
+            search_query = f"management and referral guidelines for {worst_condition_name} diabetic retinopathy Malaysia"
+
+        # --- STEP 4: Re-run RAG retrieval ---
+        query_vector = embeddings.embed_query(search_query)
+
+        rpc_response = supabase.rpc(
+            "match_documents",
+            {
+                "query_embedding": query_vector,
+                "match_threshold": 0.45,
+                "match_count": 5
+            }
+        ).execute()
+
+        retrieved_docs = rpc_response.data or []
+        contexts = [d.get("content", "") for d in retrieved_docs]
+
+        if not contexts:
+            raise HTTPException(status_code=404, detail="No retrieved documents found for evaluation.")
+
+        # --- STEP 5: Build RAGAS Dataset and evaluate ---
+        ragas_dataset = Dataset.from_dict({
+            "question": [search_query],
+            "answer": [rag_summary],
+            "contexts": [contexts],
+        })
+
+        ragas_result = evaluate(
+            dataset=ragas_dataset,
+            metrics=[faithfulness, answer_relevancy, context_precision],
+        )
+
+        scores = {k: float(v) for k, v in ragas_result.items() if isinstance(v, (int, float))}
+
+        # --- STEP 6: Persist scores to ai_results (best-effort) ---
+        try:
+            supabase.table("ai_results").update(
+                {"ragas_scores": scores}
+            ).eq("screening_session_id", str(screening_session_id)).execute()
+            logger.info(f"RAGAS scores persisted for session {screening_session_id}")
+        except Exception as persist_err:
+            logger.warning(f"Failed to persist ragas_scores (column may not exist): {persist_err}")
+
+        return {
+            "ok": True,
+            "session_id": str(screening_session_id),
+            "condition": worst_condition_name,
+            "scores": scores,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"RAGAS evaluation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"RAGAS evaluation failed: {str(e)}")
