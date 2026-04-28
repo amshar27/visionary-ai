@@ -14,6 +14,7 @@ from .ai import router as ai_router
 from .staff import router as staff_router
 from .admin import router as admin_router
 from .appointments import router as appointments_router
+from .auth_reset import router as auth_reset_router
 from .scheduler import start_scheduler
 
 # -------------------------------------------------
@@ -81,3 +82,4 @@ app.include_router(ai_router)
 app.include_router(staff_router)
 app.include_router(admin_router)
 app.include_router(appointments_router)
+app.include_router(auth_reset_router)

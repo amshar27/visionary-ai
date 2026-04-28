@@ -1,369 +1,405 @@
-# Visionary AI — Project & Session Context
+# Visionary AI — CLAUDE.md
 
-> Last updated: 2026-04-05 — generated from live codebase scan
+Clinical-grade eye disease screening system built as a Final Year Project for Malaysian healthcare. AI-assisted diabetic retinopathy, cataract, and glaucoma detection, with a nurse → doctor → patient workflow.
 
 ---
 
-## 1. Project Overview
-
-**Visionary AI** is a clinical-grade multi-disease eye screening system built as a Final Year Project for Malaysian healthcare. Nurses upload retinal fundus images → AI model detects disease → Doctor reviews AI results and generates a RAG-powered clinical report → Doctor approves or overrides → Report sent to patient via email.
+## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Backend | FastAPI (Python), uvicorn, port **8000** |
-| Frontend | React 19 + TypeScript (Vite), port **5173** |
-| Database | Supabase (PostgreSQL + Object Storage + pgvector) |
-| AI Model | PyTorch — `ResNetWithAttention` (ResNet152 + MultiheadAttention), 5 DR classes, Grad-CAM heatmaps |
-| LLM / RAG | GPT-4o-mini (per-eye `llm_summary`), GPT-4o (full RAG clinical report), LangChain + Supabase vector store |
-| Auth | No JWT — bcrypt login, user object in `localStorage` as `visionary_user` |
-| Email | Resend — confirmation on booking, 24-hour reminder, clinical report to patient |
-| Scheduling | APScheduler (BackgroundScheduler) — two jobs run every 1 minute |
+| Backend API | FastAPI (Python), run via uvicorn |
+| Frontend | React + TypeScript (Vite), port 5173 |
+| Database | Supabase (PostgreSQL) |
+| Storage | Supabase Storage (bucket: `retinal-scans`, `guidelines`) |
+| AI Model | PyTorch — ResNetWithAttention (ResNet152 + MultiheadAttention) |
+| AI Explainability | Grad-CAM heatmaps via `pytorch-grad-cam` |
+| LLM (summaries) | OpenAI `gpt-4o-mini` |
+| LLM (RAG reports) | OpenAI `gpt-4o` |
+| RAG pipeline | LangChain + OpenAI embeddings (`text-embedding-3-small`) + Supabase vector store |
+| RAG evaluation | RAGAS (`ragas` + HuggingFace `datasets`) — faithfulness, answer_relevancy, context_precision |
+| Auth | Custom bcrypt — no JWT; user object stored in `localStorage` |
+| Email | Resend (`RESEND_API_KEY`) |
+| Scheduler | APScheduler (BackgroundScheduler) — runs in-process |
 
 ---
 
-## 2. How to Run
+## Running the Project
 
+### Backend
 ```bash
-# Backend — run from project root
-uvicorn backend.main:app --reload --port 8000
+# From project root, activate venv first
+.venv\Scripts\activate
 
-# Frontend
-cd frontend-react && npm run dev
+# Run FastAPI with uvicorn (must be run from project root so relative paths resolve)
+uvicorn backend.main:app --reload --port 8000
+```
+The model loads from `backend/model/best_model.pth` at startup. If the file is missing, the backend starts but `/ai/analyze` will return 503.
+
+**CORS is hard-coded** to `http://localhost:5173` and `http://127.0.0.1:5173`. Changing it requires a full uvicorn restart — hot-reload does NOT pick up middleware changes.
+
+### Frontend
+```bash
+cd frontend-react
+npm install   # first time only
+npm run dev   # starts on http://localhost:5173
 ```
 
-CORS is configured for `http://localhost:5173` and `http://127.0.0.1:5173`. Must restart uvicorn after any CORS change — middleware is not hot-reloaded.
+### Required `.env` (project root)
+```
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+OPENAI_API_KEY=...
+RESEND_API_KEY=...
+```
 
 ---
 
-## 3. Roles & Workflow
+## Directory Structure
 
-### Nurse (`/nurse`) — 5 sub-views
-1. `home` — landing screen, patient search sidebar, "Add New Patient" CTA
-2. `new-patient` — full-screen registration form (sidebar hidden while active)
-3. `workspace` — selected patient: view info, create sessions, upload images, trigger AI, assign doctor
-4. `session` — per-session detail: AI results per eye, heatmaps, assign doctor
-5. `appointments` — calendar view (Month/Week/Day) with booking modal
-
-Patient search/selection is done exclusively via the sidebar. The sidebar auto-refreshes after a new patient is created.
-
-### Doctor (`/doctor`) — 3 sub-views
-1. `inbox` — all sessions assigned to this doctor, filterable by status; every row has an Open/View button regardless of status
-2. `review` — full workflow: AI result inspection, RAG report generation, approve or override
-3. `appointments` — read-only calendar of this doctor's own appointments (no booking or status-change capability)
-
-**ReviewView workflow order (enforced):**
-1. Generate Clinical Research Summary button (always visible, centred)
-2. RAG loading spinner while generating
-3. AI Clinical Summary card renders when `ragResult !== null`
-4. Doctor Actions (Approve / Override / Send Report) only render when `ragResult !== null || isLocked`
-5. `isLocked = ['approved', 'overridden'].includes(status)` — disables all action buttons in read-only mode
-
-### Admin (`/admin`) — 2 tabs
-- **System Users tab**: list all staff, update name, reset password, delete user
-- **All Patients tab**: list all patients, update patient info, delete patient
+```
+visionary_ai/
+├── .env                          # secrets (never commit)
+├── requirements.txt              # Python deps (root-level copy)
+├── backend/
+│   ├── main.py                   # FastAPI app, CORS, router registration, scheduler start
+│   ├── db.py                     # Supabase client (uses SERVICE_ROLE_KEY)
+│   ├── auth.py                   # /auth/login + /auth/register
+│   ├── auth_reset.py             # /auth/forgot-password + /auth/verify-otp + /auth/reset-password
+│   ├── auth_utils.py             # bcrypt hash_password / verify_password
+│   ├── patients.py               # /patients CRUD
+│   ├── screenings.py             # /screenings workflow + send-report
+│   ├── uploads.py                # /uploads/retinal (multipart, upserts by eye_side)
+│   ├── ai.py                     # /ai/* — model inference, Grad-CAM, RAG
+│   ├── staff.py                  # /staff/doctors
+│   ├── admin.py                  # /admin/* staff and patient management
+│   ├── appointments.py           # /appointments CRUD with 30-min overlap check
+│   ├── notification_service.py   # Resend email: confirmation, reminder, clinical report, OTP
+│   ├── scheduler.py              # APScheduler: send_reminders + auto_no_show (every 1 min)
+│   ├── requirements.txt          # backend-specific deps
+│   └── model/
+│       └── best_model.pth        # trained ResNetWithAttention weights
+└── frontend-react/
+    ├── src/
+    │   ├── App.tsx               # BrowserRouter, route definitions, role redirect
+    │   ├── main.tsx              # React entrypoint
+    │   ├── context/
+    │   │   └── AuthContext.tsx   # useAuth hook, localStorage session (key: visionary_user)
+    │   ├── components/
+    │   │   └── ProtectedRoute.tsx  # role-based guard, redirects wrong-role to their home
+    │   ├── pages/
+    │   │   ├── Landing.tsx       # dark hero, redirects logged-in users to role dashboard
+    │   │   ├── Login.tsx         # email/password form + "Forgot password?" link
+    │   │   ├── Register.tsx      # staff_id + email + password (validated against registry)
+    │   │   ├── ForgotPassword.tsx  # 4-step OTP password reset (email → OTP → new pw → success)
+    │   │   ├── NurseDashboard.tsx  # 4 sub-views: search, new-patient, workspace, session
+    │   │   ├── DoctorDashboard.tsx # 2 sub-views: inbox, review (RAG + override modal)
+    │   │   └── AdminDashboard.tsx  # top navbar + 2 tabs: staff users, patients
+    │   ├── services/
+    │   │   └── api.ts            # Axios instance (baseURL: http://localhost:8000) + all API fns
+    │   ├── types/
+    │   │   └── index.ts          # all TypeScript interfaces
+    │   └── utils/
+    │       └── format.ts         # formatDt, getEyeSide, fmtConfidence, shortId
+    └── package.json
+```
 
 ---
 
-## 4. Session Status Flow & Lock Logic
+## Backend Modules
+
+### `main.py`
+FastAPI app. Registers all routers and calls `start_scheduler()` on startup. CORS is configured here.
+
+### `db.py`
+Creates the global `supabase` client using `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`. Uses `ClientOptions(storage_client_timeout=120)`.
+
+### `auth.py` — `/auth`
+- `POST /auth/login` — verifies email+bcrypt, returns user object (no token)
+- `POST /auth/register` — validates staff_id against `employee_registry`, enforces email match, forces role from registry, creates `staff_users` row
+
+### `auth_reset.py` — `/auth` (password reset)
+- `POST /auth/forgot-password` — generates 6-digit OTP (expires 10 min), deletes prior unused OTPs for same email, sends via `send_otp_email`. Always returns a safe generic message regardless of whether email exists.
+- `POST /auth/verify-otp` — validates OTP (unused + unexpired), marks it `used=true`. Returns 400 if invalid/expired.
+- `POST /auth/reset-password` — checks a recently-used OTP exists (within 15 min), rejects if new password matches current, bcrypt-hashes and saves new password.
+
+Requires `password_reset_otps` table (see DDL comment at top of `auth_reset.py`):
+`id, email, otp_code, created_at, expires_at, used`
+
+### `auth_utils.py`
+bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
+
+### `patients.py` — `/patients`
+- `GET /patients?q=&limit=` — search by name or ic_passport (ilike)
+- `GET /patients/{id}` — single patient
+- `POST /patients` — create patient
+
+### `screenings.py` — `/screenings`
+- `GET /screenings/by-patient/{patient_id}` — list sessions for a patient
+- `POST /screenings/create` — creates session with auto-incremented `session_number`
+- `POST /screenings/assign-doctor` — sets `assigned_doctor_id` + status=assigned (blocked if locked)
+- `GET /screenings/assigned-to/{doctor_id}` — enriched inbox (joins patient name + nurse name)
+- `GET /screenings/{id}` — single session (joins patient)
+- `GET /screenings/{id}/doctor-review/latest` — most recent doctor_reviews row
+- `POST /screenings/{id}/doctor-review` — inserts review, updates session status to approved/overridden
+- `POST /screenings/{id}/send-report` — converts markdown report to HTML, emails patient via Resend
+- `DELETE /screenings/{id}` — only deletes pending sessions with no uploads and no assigned doctor
+
+### `uploads.py` — `/uploads`
+- `POST /uploads/retinal` — multipart upload to `retinal-scans` bucket; UPSERTS on `(screening_session_id, eye_side)` so re-uploading replaces rather than duplicates. Cleans up old storage object after replace.
+- `GET /uploads/retinal/by-session/{id}` — lists images for session (max 2: left + right), adds `image_url`
+
+### `ai.py` — `/ai`
+- `POST /ai/analyze?screening_session_id=` — runs model on both eyes, generates Grad-CAM, upserts to `ai_results`, sets session status=analysed. Requires both left and right images. Blocked if session status is in `{assigned, approved, overridden}`.
+- `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use.
+- `GET /ai/results/by-session/{id}` — returns ai_results rows for session
+- `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, `warnings`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately).
+- `POST /ai/summarise-rag?screening_session_id=` — generates full RAG clinical report via a 2-step LLM pipeline: (1) gpt-4o-mini extracts/condenses guidelines from retrieved docs, (2) gpt-4o writes the final structured report. Fetches patient history, doctor name, past session history, current AI results, then queries `match_documents` RPC (threshold=0.45, count=5). Persists the report to `ai_results.rag_summary`. Defensively reads severity as `dr_severity or severity_label or 'none'` to handle doctor-overridden rows where `dr_severity` is null.
+- `GET /ai/rag-summary/{id}` — returns persisted rag_summary field from the first ai_results row for the session
+- `POST /ai/evaluate-rag/{screening_session_id}` — evaluates an existing RAG summary using RAGAS metrics (faithfulness, answer_relevancy, context_precision). Re-runs retrieval to build the evaluation dataset. Best-effort persists scores to `ai_results.ragas_scores`. Returns `{ok, session_id, condition, scores}`. Also reads severity defensively.
+- `GET /ai/health` — model load status + device + classes
+- `POST /ai/ingest-research?bucket_name=guidelines` — one-time ingestion of PDFs into vector store
+
+### `staff.py` — `/staff`
+- `GET /staff/doctors` — lists staff_users with role=doctor (for nurse dropdown)
+
+### `admin.py` — `/admin`
+All endpoints check `requester_role == "admin"`.
+- `GET /admin/staff-users?role=admin` — list all staff_users
+- `PATCH /admin/staff-users/{staff_id}` — update name
+- `PATCH /admin/staff-users/{staff_id}/password` — reset password (bcrypt)
+- `DELETE /admin/staff-users/{staff_id}` — delete account
+- `GET /admin/patients?role=admin` — list all patients
+- `PATCH /admin/patients/by-ic/{ic_passport}` — update name/ic_passport/contact_number
+- `DELETE /admin/patients/by-ic/{ic_passport}` — delete patient
+
+### `appointments.py` — `/appointments`
+- `POST /appointments` — create appointment; enforces future datetime, 30-min overlap check per doctor, sends confirmation email, stamps `confirmation_sent_at`
+- `GET /appointments?patient_id=&assigned_doctor_id=` — list (joins patient name/email)
+- `PATCH /appointments/{id}` — update status or notes
+
+### `notification_service.py`
+Resend email helpers (all fire-and-forget, return bool):
+- `send_appointment_confirmation(...)` — blue header, appointment details
+- `send_appointment_reminder(...)` — purple header, "tomorrow" reminder
+- `send_clinical_report(...)` — green header, approved RAG report HTML
+- `send_otp_email(to_email, to_name, otp_code)` — dark-themed OTP email for password reset (10-min expiry)
+
+### `scheduler.py`
+APScheduler runs two jobs every 1 minute:
+- `send_reminders()` — finds appointments 23h59m–24h01m away with no `notification_sent_at`, sends reminder, stamps field
+- `auto_no_show()` — marks scheduled appointments >30 min past their time as `no_show`
+
+---
+
+## AI Model Details
+
+**Architecture**: `ResNetWithAttention`
+- Backbone: ResNet152 (last FC + AvgPool removed → feature maps)
+- Attention: `nn.MultiheadAttention(embed_dim=2048, num_heads=8)` over spatial positions
+- Head: `nn.Linear(2048, 7)`
+
+**7 Classes** (updated from 5):
+```python
+CLASSES = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative DR', 'Cataract', 'Glaucoma']
+```
+
+**Severity map** (stored in DB as `dr_severity`):
+```python
+{'No DR': 'none', 'Mild': 'mild', 'Moderate': 'moderate',
+ 'Severe': 'severe', 'Proliferative DR': 'proliferative',
+ 'Cataract': 'cataract', 'Glaucoma': 'glaucoma'}
+```
+
+**Referability**: `referable = predicted_idx >= 2` (Moderate and above)
+
+**Follow-up intervals**:
+- none/mild → 12 months, moderate → 6 months, severe → 3 months
+- proliferative → 1 month, cataract → specialist eval, glaucoma → urgent referral
+
+**Heatmaps**: Grad-CAM on last ResNet block (`model.backbone[-1][-1]`). Uploaded to `retinal-scans/heatmaps/` bucket. Non-fatal — if heatmap fails, analysis still completes.
+
+**Model path**: `backend/model/best_model.pth` (relative to CWD, so uvicorn must be run from project root)
+
+---
+
+## Database Tables
+
+### `staff_users`
+`id, email, password_hash, role (nurse|doctor|admin), staff_id, name`
+
+### `employee_registry`
+`staff_id, email, full_name, allowed_role` — pre-populated by admin; controls who can register.
+
+### `patients`
+`id, name, ic_passport (unique), age, sex (M|F|Other), contact_number, email, diabetes_known (Yes/No/Unknown), diabetes_type, diabetes_duration_years, notes, glaucoma_family_history, elevated_iop_history, previous_eye_surgery, visual_symptoms, comorbidities, allergies, created_at, created_by`
+
+### `screening_sessions`
+`id, patient_id (FK), session_number (auto-increment per patient), status, created_by (FK staff_users), assigned_doctor_id (FK staff_users), session_date, created_at`
+
+### `retinal_images`
+`id, screening_session_id (FK), eye_side (left|right), image_path, image_url, uploaded_at`
+Unique constraint: `(screening_session_id, eye_side)` — enables UPSERT re-upload.
+
+### `ai_results`
+`id, screening_session_id (FK), eye (not eye_side!), disease_detected, dr_severity, disease_type, severity_label, predicted_class, referable, confidence_score, macular_involvement, llm_summary, rag_summary, ragas_scores (jsonb), follow_up_interval, warnings (array), class_probabilities (jsonb), heatmap_url, created_at`
+Unique constraint: `(screening_session_id, eye)` — enables UPSERT re-analysis.
+Note: `predicted_class` exists in the DB schema but is **not currently written** by the `/ai/analyze` endpoint (the upsert dict omits it). It will be `null` unless set manually.
+Note: After a doctor inline override (`PATCH /ai/result/{id}`), `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and `warnings` are all set to null/empty. Only `disease_detected`, `disease_type`, and `severity_label` carry the doctor's values. Always read severity as `dr_severity or severity_label` defensively.
+
+### `doctor_reviews`
+`id, screening_session_id (FK), doctor_id (FK), decision (approved|overridden), final_grade_left, final_grade_right, override_reason, report_url, reviewed_at`
+
+### `appointments`
+`id, patient_id (FK), scheduled_by (FK staff_users), assigned_doctor_id (FK), appointment_datetime, status (scheduled|completed|cancelled|no_show), notes, confirmation_sent_at, notification_sent_at, created_at`
+
+### `password_reset_otps`
+`id, email, otp_code, created_at, expires_at, used (bool)` — OTP records for self-service password reset. OTPs expire after 10 minutes; used OTPs are kept so the 15-min reset window can be validated. Index on `email`.
+
+### `documents`
+Vector store table — used by LangChain `SupabaseVectorStore`. Queried via `match_documents` RPC function. Populated by `/ai/ingest-research`.
+
+---
+
+## Session Status Flow
 
 ```
 pending → assigned → analysed → approved
-                              → overridden
+                              ↘ overridden
 ```
 
-| What is locked | Blocked when status is… |
-|---|---|
-| Re-upload images | `assigned`, `approved`, `overridden` |
-| Re-run AI analysis | `assigned`, `approved`, `overridden` |
-| Assign / reassign doctor | `approved`, `overridden` only |
-| Doctor review (approve/override) | `approved`, `overridden` (already reviewed) |
-| Delete session | Only deletable when `pending` AND no uploads AND no doctor assigned |
+### Lock Logic
 
-`ai.py` uses `LOCKED_STATUSES = {"assigned", "approved", "overridden"}` to block `/analyze`.
-`screenings.py` uses `LOCKED_STATUSES = {"approved", "overridden"}` to block doctor review and reassignment.
+| Action | Blocked when status is |
+|---|---|
+| Upload images | `{assigned, approved, overridden}` |
+| Run AI analysis | `{assigned, approved, overridden}` |
+| Assign doctor | `{approved, overridden}` — reassign allowed when `assigned` |
+| Doctor review | `{approved, overridden}` |
+| Delete session | anything except `pending`; also blocked if has uploads or assigned doctor |
 
 ---
 
-## 5. Database Tables (Supabase)
+## Frontend Pages & Role Routing
 
-Inferred from actual Supabase calls in backend files.
+Routes are in `App.tsx`. `ProtectedRoute` redirects unauthenticated users to `/login` and wrong-role users to their own dashboard (not a 403 page).
 
-| Table | Key columns |
-|---|---|
-| `staff_users` | `id`, `staff_id`, `email`, `password_hash`, `role` (`nurse`/`doctor`/`admin`), `name` |
-| `employees_registry` | Employee records (read-only reference) |
-| `patients` | `id`, `name`, `ic_passport`, `age`, `sex`, `contact_number`, `email` (nullable), `diabetes_known` (text: `'Yes'`/`'No'`/`'Unknown'`), `diabetes_type`, `diabetes_duration_years`, `glaucoma_family_history`, `elevated_iop_history`, `previous_eye_surgery` (text, default `'Unknown'`), `visual_symptoms` (text, default `'None'`), `comorbidities`, `notes` |
-| `screening_sessions` | `id`, `patient_id` (FK), `session_number`, `session_date`, `status`, `created_by` (FK → `staff_users`), `assigned_doctor_id` (FK → `staff_users`) |
-| `retinal_images` | `id`, `screening_session_id` (FK), `eye_side` (text: `'left'`/`'right'`), `image_url`, `image_path` |
-| `ai_results` | `id`, `screening_session_id` (FK), `eye` (text: `'left'`/`'right'`), `disease_detected` (bool), `disease_type` (text, nullable — not yet populated), `severity_label` (text, nullable — not yet populated), `dr_severity` (text), `referable` (bool), `confidence_score` (float), `class_probabilities` (json), `follow_up_interval`, `warnings` (array), `llm_summary`, `macular_involvement`, `heatmap_url`, `rag_summary` (text, nullable), `created_at` |
-| `doctor_reviews` | `id`, `screening_session_id` (FK), `doctor_id` (FK), `decision` (`approved`/`overridden`), `final_grade_left`, `final_grade_right`, `override_reason`, `report_url`, `reviewed_at` |
-| `documents` | pgvector store — `content`, `metadata`, `embedding` — queried via `match_documents` RPC |
-| `appointments` | `id`, `patient_id` (FK), `scheduled_by` (FK → `staff_users`), `assigned_doctor_id` (FK → `staff_users`), `appointment_datetime` (timestamptz), `status` enum (`scheduled`/`completed`/`cancelled`/`no_show`), `notes`, `confirmation_sent_at` (timestamptz, nullable), `notification_sent_at` (timestamptz, nullable), `created_at` |
-
----
-
-## 6. Backend Structure
-
-All router files sit flat in `backend/` (no subfolders). Registered in `main.py` with `app.include_router(...)`.
-
-| File | Prefix | Endpoints |
+| Route | Component | Role |
 |---|---|---|
-| `auth.py` | `/auth` | `POST /auth/login`, `POST /auth/register` |
-| `patients.py` | `/patients` | `GET /patients` (search, `?q=&limit=`), `POST /patients`, `GET /patients/{id}` |
-| `screenings.py` | `/screenings` | `GET /screenings/by-patient/{id}`, `POST /screenings/create`, `POST /screenings/assign-doctor`, `GET /screenings/assigned-to/{doctor_id}`, `GET /screenings/{id}`, `GET /screenings/{id}/doctor-review/latest`, `POST /screenings/{id}/doctor-review`, `POST /screenings/{id}/send-report`, `DELETE /screenings/{id}` |
-| `uploads.py` | `/uploads` | `POST /uploads/retinal` (multipart), `GET /uploads/retinal/by-session/{id}` |
-| `ai.py` | `/ai` | `POST /ai/analyze?screening_session_id=`, `GET /ai/results/by-session/{id}`, `GET /ai/health`, `POST /ai/reanalyze/{id}`, `GET /ai/rag-summary/{id}`, `POST /ai/summarise-rag?screening_session_id=`, `POST /ai/ingest-research` |
-| `staff.py` | `/staff` | `GET /staff/doctors` |
-| `admin.py` | `/admin` | `GET /admin/staff-users`, `PATCH /admin/staff-users/{staff_id}`, `PATCH /admin/staff-users/{staff_id}/password`, `DELETE /admin/staff-users/{staff_id}`, `GET /admin/patients`, `PATCH /admin/patients/by-ic/{ic}`, `DELETE /admin/patients/by-ic/{ic}` |
-| `appointments.py` | `/appointments` | `POST /appointments`, `GET /appointments` (`?patient_id=&assigned_doctor_id=`), `PATCH /appointments/{id}` |
-| `db.py` | — | Supabase client, reads `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` from `.env` |
-| `auth_utils.py` | — | bcrypt hash/verify helpers |
-| `notification_service.py` | — | No router — pure helpers: `send_appointment_confirmation()`, `send_appointment_reminder()`, `send_clinical_report()` |
-| `scheduler.py` | — | `start_scheduler()` wired to `@app.on_event("startup")` — runs `send_reminders()` and `auto_no_show()` every 1 minute |
+| `/` | Landing | public |
+| `/login` | Login | public |
+| `/register` | Register | public |
+| `/forgot-password` | ForgotPassword | public |
+| `/dashboard` | RoleRedirect | any (redirects to role home) |
+| `/nurse/*` | NurseDashboard | nurse |
+| `/doctor/*` | DoctorDashboard | doctor |
+| `/admin/*` | AdminDashboard | admin |
+
+### NurseDashboard — 4 sub-views
+1. **search** — search patients by name or IC/passport
+2. **new-patient** — register a new patient
+3. **workspace** — select patient, view/create screening sessions
+4. **session** — upload L/R images, trigger AI, assign to doctor, delete pending session
+
+Sidebar patient list shows patient name only (IC line removed).
+
+### DoctorDashboard — 2 sub-views
+1. **inbox** — list sessions assigned to the logged-in doctor
+2. **review** — AI Verdict section with original/heatmap toggle (EyePanel), per-eye edit widgets, RAG report, and Approve or Submit button. Raw retinal images are **not** shown as a separate section — they are accessible only via the heatmap toggle within AI Verdict. The old Override modal has been removed.
+
+**Per-eye inline edit flow** (replaces the old Override button):
+- Each eye widget has an **Edit** button (visible when session is not locked).
+- Clicking Edit switches the widget into a 3-field form: Disease Detected, Disease Type, Severity. Severity options are driven by `getSeverityOptions(diseaseType, diseaseDetected)`.
+- Clicking **Confirm** opens a custom `showOverrideConfirm` modal. On confirmation, calls `PATCH /ai/result/{id}`, updates local `aiResults` state, and collapses the widget to a post-edit summary with a "Doctor Edited" amber badge.
+- When at least one eye has been edited, the **Approve** button is replaced by a **Submit** button. Submit calls `POST /screenings/{id}/doctor-review` with `decision=overridden` and a fixed override reason.
+- All edit state (`leftEditing`, `rightEditing`, `leftEdited`, `rightEdited`, `leftEditForm`, `rightEditForm`, `leftConfirmed`, `rightConfirmed`, `showOverrideConfirm`, `pendingConfirmEye`) resets when the doctor navigates to a different session.
+
+Sidebar session list shows patient name + session number only (Status line removed). Refresh button next to ← Back to Inbox has been removed.
+
+### AdminDashboard — 2 tabs
+1. **staff users** — list, rename, reset password, delete staff accounts
+2. **patients** — list, update (name/IC/contact), delete patient records
 
 ---
 
-## 7. Frontend Structure
+## Known Field Inconsistencies — Always Handle These
 
-All pages in `frontend-react/src/pages/`. Route guards in `src/components/ProtectedRoute.tsx`.
+### `eye` vs `eye_side` in AI results
+The `ai_results` table uses the column `eye` (not `eye_side`). The frontend `AIResult` type uses `eye_side`. The `getEyeSide()` util handles this:
+```typescript
+// utils/format.ts
+export function getEyeSide(result: Record<string, unknown>): string {
+  return ((result['eye_side'] ?? result['eye']) as string ?? '').toLowerCase();
+}
+```
+Always use `getEyeSide(result)` when reading eye side from AI result objects.
 
-| Route | File | Access |
-|---|---|---|
-| `/` | `Landing.tsx` | Public — redirects logged-in users to role dashboard |
-| `/login` | `Login.tsx` | Public |
-| `/register` | `Register.tsx` | Public |
-| `/nurse/*` | `NurseDashboard.tsx` | Nurse only |
-| `/doctor/*` | `DoctorDashboard.tsx` | Doctor only |
-| `/admin/*` | `AdminDashboard.tsx` | Admin only |
-| `*` | catch-all | Redirects to `/` |
+### `diabetes_known` — string not boolean
+The DB stores `diabetes_known` as the string `"Yes"`, `"No"`, or `"Unknown"`. The TypeScript `PatientCreate` interface has it typed as `boolean`. When calling `patientsAPI.create(...)` from the nurse form, cast it manually:
+```typescript
+diabetes_known: formData.diabetes_known ? "Yes" : "No"  // boolean → string
+```
 
-### Key source files
+### Enriched session fields
+`GET /screenings/assigned-to/{doctor_id}` returns extra fields not in the base table:
+- `patient_name` (joined from `patients`)
+- `assigned_by_name` (joined from `staff_users` via `created_by`)
+- `session_number`, `session_date`
 
-| File | Purpose |
-|---|---|
-| `src/App.tsx` | React Router setup, role-based redirect (`ROLE_HOME`), global `<Toaster>` |
-| `src/context/AuthContext.tsx` | `AuthProvider` + `useAuth()` hook — session via `localStorage` key `visionary_user` |
-| `src/components/ProtectedRoute.tsx` | Role-based route guard |
-| `src/services/api.ts` | Axios instance (`baseURL: http://localhost:8000`) — exports `authAPI`, `patientsAPI`, `screeningsAPI`, `uploadsAPI`, `aiAPI`, `staffAPI`, `adminAPI`, `appointmentsAPI` |
-| `src/types/index.ts` | All TypeScript interfaces |
-| `src/utils/format.ts` | `formatDt`, `getEyeSide`, `fmtConfidence`, `shortId` |
-| `src/index.css` | Tailwind v4 entry |
+These are not on the `ScreeningSession` TypeScript interface — cast with `as any` or extend locally where needed.
 
-### NurseDashboard sub-view components (all inline in `NurseDashboard.tsx`)
+### `macular_involvement` — string in DB, boolean in type
+`ai.py` stores `"no"` (string). The `AIResult` TypeScript type has it as `boolean`. Handle defensively.
 
-| Component / view | Renders when |
-|---|---|
-| `home` view | default |
-| `NewPatientView` | `view.name === 'new-patient'` |
-| `WorkspaceView` | `view.name === 'workspace'` |
-| `SessionView` | `view.name === 'session'` |
-| `AppointmentsView` + `BookAppointmentModal` | `view.name === 'appointments'` |
-| `ApptChip` | Inside `AppointmentsView` week/day grids |
+### `comorbidities` — may be list or string
+In `ai.py` RAG generation, `comorbidities` from patient record may arrive as a list or a string. The backend handles this:
+```python
+if isinstance(comorbidities, list):
+    comorbidities_str = ", ".join(comorbidities)
+else:
+    comorbidities_str = str(comorbidities) if comorbidities else "None"
+```
 
-### DoctorDashboard sub-view components (all inline in `DoctorDashboard.tsx`)
+### `DoctorReviewRequest` — field name mismatch between TS and Python
+The TypeScript `DoctorReviewRequest` interface uses `final_dr_grade_left` / `final_dr_grade_right`, but the Python `DoctorReviewRequest` Pydantic model expects `final_grade_left` / `final_grade_right`. The backend will silently ignore the TS field names and store `null`. Always use the Python field names (`final_grade_left`, `final_grade_right`) when calling the endpoint directly.
 
-| Component / view | Renders when |
-|---|---|
-| `InboxView` | `view.name === 'inbox'` |
-| `ReviewView` | `view.name === 'review'` |
-| `DoctorAppointmentsView` | `view.name === 'appointments'` |
+### `dr_severity` — can be null after doctor inline override
+After `PATCH /ai/result/{id}`, the `dr_severity` column is set to `null`. Any backend code that reads `result['dr_severity']` directly will raise a `NoneType` error. Always read defensively:
+```python
+severity = result.get('dr_severity') or result.get('severity_label') or 'none'
+```
+This applies in `generate_rag_summary` and `evaluate_rag` in `ai.py` (already fixed). Apply the same pattern to any future code that reads `dr_severity` from `ai_results` rows.
 
 ---
 
-## 8. Key Conventions & Known Gotchas
+## Auth Pattern
 
-### Field naming
-
-| Field | Notes |
-|---|---|
-| `eye` vs `eye_side` | `ai_results` table uses `eye` (inserted by `ai.py`); `retinal_images` uses `eye_side`. Always normalise with `getEyeSide(result)` from `utils/format.ts` which reads `result.eye_side ?? result.eye` |
-| `diabetes_known` | Stored as string `'Yes'`/`'No'`/`'Unknown'` in DB and sent as string from frontend. TypeScript `PatientCreate` types it as `boolean` — cast at call site with `as unknown as boolean` when needed |
-| `email` on PatientCreate | Not in the `PatientCreate` TypeScript interface — appended manually to the payload at the call site. Send `null` (never `""`) if empty |
-| Enriched session fields | `patient_name`, `session_number`, `session_date`, `assigned_by_name` are joined fields not on the base `ScreeningSession` type — access via `(session as unknown as Record<string, unknown>).field_name` |
-| Supabase join key | When `GET /screenings/{id}` joins patients, Supabase returns the join under key `patients` (the table name), not `patient`. Access as `(session as any)?.patients?.email` |
-| `DoctorReviewRequest` type | ⚠️ **Bug**: `src/types/index.ts` still has `final_dr_grade_left`/`final_dr_grade_right` (old names). The backend Pydantic model uses `final_grade_left`/`final_grade_right`. The `DoctorReview` response interface already uses the correct new names. The TypeScript request type needs updating. |
-
-### Auth pattern
-- Login hits `POST /auth/login` → returns user object
-- Stored in `localStorage` under key `'visionary_user'`
-- `AuthContext` restores from localStorage on mount
-- No tokens, no expiry — user identity passed in request bodies where needed (`created_by`, `doctor_id`, `scheduled_by`, etc.)
-
-### Tailwind v4 setup
-- Entry: `@import "tailwindcss"` in `src/index.css` — NOT `@tailwind base/components/utilities`
-- Plugin: `@plugin "@tailwindcss/typography"` in `index.css` (not in a config file)
-- Custom tokens: `@theme { --color-primary: #0ea5e9; --font-sans: 'Inter', system-ui, sans-serif; }`
-
-### `npm` dependencies (key)
-```
-react@19, react-router-dom@7, axios@1
-lucide-react, react-hot-toast, react-markdown
-tailwindcss@4, @tailwindcss/vite@4, @tailwindcss/typography@0.5
-vite@7, typescript@5
-```
+- No JWT. Login returns a plain user object `{user_id, email, role, staff_id, name}`.
+- Stored in `localStorage` under key `visionary_user`.
+- `useAuth()` reads this on mount.
+- User identity is passed in request bodies where needed (e.g., `created_by`, `doctor_id`, `requester_role`).
+- Admin endpoints accept `requester_role` as a query param or body field and do their own `assert_admin()` check — there is no middleware-level auth.
 
 ---
 
-## 9. Appointments Feature
+## API Conventions
 
-### Booking flow
-1. Nurse opens Appointments calendar → clicks "Set New Appointment"
-2. `BookAppointmentModal` — selects patient, doctor, date (min = today), time via hour/minute/AM-PM dropdowns
-3. Time conversion: `AM: hour === 12 ? 0 : hour` / `PM: hour === 12 ? 12 : hour + 12`
-4. Builds ISO string: `"YYYY-MM-DDTHH:MM:00+08:00"` (hardcoded UTC+8 offset)
-5. **Frontend guard**: if constructed datetime ≤ now → `toast.error(...)` and return without calling API
-6. **Backend guard** (`POST /appointments`): `if payload.appointment_datetime <= datetime.now(timezone.utc)` → HTTP 400
-7. **Overlap check**: backend rejects if doctor has another active appointment within 30 minutes (excludes `cancelled` and `no_show`); returns HTTP 409 — frontend shows "Appointments must be at least 30 minutes apart."
-8. On success: inserts row, sends confirmation email (if patient has email), stamps `confirmation_sent_at`
-
-### Calendar timezone handling
-All `appointment_datetime` values from the API are parsed into MYT (UTC+8) for display:
-```ts
-const localDate = new Date(new Date(appt.appointment_datetime)
-  .toLocaleString('en-US', { timeZone: 'Asia/Kuala_Lumpur' }))
+All backend responses follow one of two shapes:
+```json
+{ "ok": true, "data": [...] }          // list/detail endpoints
+{ "ok": true, "message": "..." }        // action endpoints
+{ "ok": false, "detail": "..." }        // error (HTTP 4xx/5xx)
 ```
-Applied in: `ApptChip` (chip label time), `apptForDay` (day column placement), `apptForSlot` (hour row placement). Week boundary (`weekStart`) is also derived from KL local time.
-
-### Email notifications
-| Trigger | Function | Guard column | Header colour |
-|---|---|---|---|
-| Immediately after `POST /appointments` | `send_appointment_confirmation()` | `confirmation_sent_at` | Blue `#2563eb` |
-| 24 hours before `appointment_datetime` | `send_appointment_reminder()` | `notification_sent_at` | Purple `#7c3aed` |
-| After doctor approves/overrides | `send_clinical_report()` | — (manual trigger) | Green `#16a34a` |
-
-All email functions: try/except, print on error, return `bool`. From address: `"Visionary AI <onboarding@resend.dev>"`. `RESEND_API_KEY` read from `.env`.
-
-Datetime displayed in emails: localised to `Asia/Kuala_Lumpur` via `pytz`, formatted as `"Wednesday, 08 April 2026 at 06:00 PM"`.
-
-### Scheduler jobs (`backend/scheduler.py`)
-Both jobs run every **1 minute** via APScheduler `BackgroundScheduler`, started in `@app.on_event("startup")`.
-
-| Job | Logic |
-|---|---|
-| `send_reminders()` | Finds appointments where `appointment_datetime` is between `now+23h59m` and `now+24h01m`, `notification_sent_at IS NULL`, `status='scheduled'` → sends reminder → stamps `notification_sent_at` |
-| `auto_no_show()` | Finds appointments where `appointment_datetime < now-30min`, `status='scheduled'` → updates to `no_show` |
-
-### Status / action rules
-- `scheduled`: can Mark Complete, Cancel
-- `no_show`: can Mark Complete (late arrival), Cancel
-- `completed` / `cancelled`: no actions available
-- Only `scheduled` and `completed` block time slots — `cancelled` and `no_show` are free to rebook
+Exception: Appointments endpoints return the appointment object directly (no `ok` wrapper). `axios` interceptor in `api.ts` maps `error.response.data.detail` to a plain `Error`.
 
 ---
 
-## 10. AI Pipeline
+## Important Conventions
 
-### Model
-- **Architecture**: `ResNetWithAttention` — ResNet152 backbone (all layers except final FC) + `nn.MultiheadAttention` (8 heads, embed_dim=2048) + `nn.Linear(2048, 5)`
-- **File**: `backend/model/best_model.pth`
-- **Classes** (5): `['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative DR']`
-- **Device**: CUDA if available, else CPU
-- **Transform**: Resize(256) → CenterCrop(224) → ToTensor → Normalize(ImageNet stats)
-
-### `POST /ai/analyze` flow
-1. Validates session exists and is not locked (`assigned`/`approved`/`overridden`)
-2. Fetches retinal images — requires both left AND right eye images
-3. For each eye: downloads image from Supabase Storage URL → runs `predict_image()` → generates Grad-CAM heatmap → uploads heatmap to `retinal-scans` bucket under `heatmaps/` path → gets public URL
-4. Upserts result row to `ai_results` — conflict key: `(screening_session_id, eye)`
-5. Updates session status to `'analysed'`
-
-### `predict_image()` returns
-`predicted_class`, `dr_severity` (mapped to `none`/`mild`/`moderate`/`severe`/`proliferative`), `dr_presence` (bool, any class > 0), `referable` (bool, class ≥ 2 = Moderate+), `confidence_score`, `class_probabilities`, `follow_up_interval`, `warnings[]`, `llm_summary` (GPT-4o-mini, 1 sentence), `macular_involvement` (hardcoded `"no"`)
-
-### What is stored in `ai_results` per row
-`screening_session_id`, `eye`, `disease_detected` (= `dr_presence`), `dr_severity`, `referable`, `confidence_score`, `macular_involvement`, `llm_summary`, `follow_up_interval`, `warnings`, `class_probabilities`, `heatmap_url`
-
-⚠️ **`disease_type` and `severity_label` columns exist in DB but are NOT written by current `ai.py`** — they remain `null` until the model is updated.
-
-### Grad-CAM
-Uses `pytorch-grad-cam` library. Target layer: `model.backbone[-1]` (last layer of ResNet152 sequential). Heatmap overlaid on 224×224 resized image using `show_cam_on_image`. Saved as JPEG, uploaded to Supabase Storage. If heatmap generation fails, analysis continues without it (non-fatal).
-
-### `POST /ai/summarise-rag` flow
-1. Fetches session → patient → doctor name (from `staff_users`)
-2. Fetches patient medical history and up to 3 previous sessions with their `dr_severity`
-3. Fetches current AI results for the session
-4. Builds RAG query: `"management and referral guidelines for {worst_severity} diabetic retinopathy Malaysia"` — **⚠️ DR-only, needs update for multi-disease**
-5. Calls `match_documents` RPC (pgvector, threshold 0.5, top 3)
-6. Generates structured report with GPT-4o (headings: Clinical Summary / Diagnostic Summary / Patient Risk Profile / Key Clinical Features / Recommended Management / Disclaimer)
-7. Persists `rag_summary` to all `ai_results` rows for this session
-8. Returns `{ rag_summary, references }`
-
-### `GET /ai/rag-summary/{session_id}`
-Returns persisted `rag_summary` or `{ rag_summary: null }` if not yet generated. Used by `ReviewView` on mount to pre-populate without re-generating.
-
----
-
-## 11. UI / Styling Standards
-
-### Shared style objects (defined at top of each dashboard file)
-```ts
-const inputStyle = { background: '#fff', border: '1px solid #d1d5db', color: '#111827' }
-const cardStyle  = { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 14,
-                     padding: '16px 20px', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }
-const elevatedCardStyle = { ...cardStyle, borderRadius: 14,  // or 16 in Nurse
-                             boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.08)' }
-```
-
-`AdminDashboard.tsx` uses a single heavier `cardStyle` with `shadow-xl` equivalent (`0 20px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.1)`) for all card widgets.
-
-### Button standard (applied across all dashboards)
-```
-cursor-pointer transition-all duration-200 hover:scale-[1.02] hover:brightness-110 active:scale-[0.98]
-```
-Disabled buttons: `cursor-not-allowed` — no scale or brightness animation.
-Sidebar patient list items: `cursor-pointer` only, no scale/brightness.
-
-### Colored box shadows on major action buttons (inline `style` prop)
-| Button type | Box shadow |
-|---|---|
-| Blue (primary, Save, Set Appointment) | `0 4px 14px rgba(59,130,246,0.4)` |
-| Green (Approve) | `0 4px 14px rgba(34,197,94,0.45)` |
-| Orange (Override) | `0 4px 14px rgba(249,115,22,0.45)` |
-| Purple (Generate RAG) | `0 4px 14px rgba(124,58,237,0.45)` |
-
-### Per-dashboard shadow conventions
-**NurseDashboard**: Home content card `shadow-xl bg-white rounded-2xl`; registration form cards `shadow-lg bg-white`; assign doctor button sits directly on page background (no card wrapper).
-
-**DoctorDashboard**: Retinal image cards `shadow-xl`; AI diagnosis image cards `shadow-xl`; LLM Summary boxes `shadow-md bg-white`; AI results info blocks wrapped in `bg-white rounded-xl shadow-md p-4`; RAG report card `shadow-2xl`; Doctor Actions buttons not wrapped in a card.
-
-**AdminDashboard**: Navbar `sticky top-0 z-50 bg-white shadow-md`; all card widgets use the heavy `cardStyle` (shadow-xl equivalent); lucide-react icons used (`KeyRound` for Reset Password, `Trash2` for Delete, `Save` for Save Name); non-delete buttons are blue (`bg-blue-600`).
-
-### Status badge colours
-| Status | Background | Text |
-|---|---|---|
-| `pending` | `#f3f4f6` | `#6b7280` |
-| `assigned` | `#dbeafe` | `#1d4ed8` |
-| `analysed` | `#ede9fe` | `#7c3aed` |
-| `approved` | `#dcfce7` | `#16a34a` |
-| `overridden` | `#ffedd5` | `#ea580c` |
-
-### Appointment chip colours
-| Status | Background | Text |
-|---|---|---|
-| `scheduled` | `#dbeafe` | `#1d4ed8` |
-| `completed` | `#dcfce7` | `#16a34a` |
-| `cancelled` | `#fee2e2` | `#dc2626` |
-| `no_show` | `#f3f4f6` | `#6b7280` |
-
----
-
-## 12. Immediate Next Steps & Known Issues
-
-### AI model (deferred to teammate)
-- [ ] Retrain / replace `backend/model/best_model.pth` to output `disease_type` (`"DR"` / `"Glaucoma"` / `"Cataract"` / `"Normal"`) and `disease_label` (disease-agnostic severity)
-- [ ] Update `ai.py` `predict_image()` to populate `disease_type` and `severity_label` in the `result_row` dict — columns exist in DB but are currently never written
-- [ ] Update warning messages in `predict_image()` — currently hardcoded as DR-specific (e.g. `"Referable diabetic retinopathy detected"`)
-- [ ] Update `generate_summary()` LLM prompt — currently DR-specific
-- [ ] Update `POST /ai/summarise-rag` RAG search query and LLM prompt — currently hardcoded to `"diabetic retinopathy"` and DR severity levels; must handle all 3 diseases
-- [ ] Ingest Glaucoma and Cataract research PDFs into the `documents` vector store (DR papers already ingested)
-
-### Frontend type bug
-- [ ] `DoctorReviewRequest` interface in `src/types/index.ts` still has `final_dr_grade_left` / `final_dr_grade_right` (old column names). Should be `final_grade_left` / `final_grade_right` to match the backend Pydantic model and the `DoctorReview` response interface.
-
-### Ocular risk factors in ReviewView
-- [ ] Display `glaucoma_family_history`, `elevated_iop_history`, `previous_eye_surgery`, `visual_symptoms` on the patient info panel in `ReviewView` (data is stored and available but not shown to the doctor)
-
-### End-to-end testing needed
-- [ ] Full nurse → doctor workflow: upload images → analyse → assign → generate RAG → approve/override → confirm redirect + toast on Inbox
-- [ ] Read-only mode: open `approved`/`overridden` session → confirm view-only banner, Approve/Override/Send Report visible but disabled
-- [ ] Appointment booking: past-datetime rejection (frontend toast + backend 400), 30-minute overlap rejection (409), confirmation email delivery
+- **uvicorn must run from project root** — `ai.py` loads `backend/model/best_model.pth` as a relative path. Running from `backend/` will fail.
+- **Model is global state in `ai.py`** — loaded once at import time. If load fails, a warning is logged but the server starts. The `/ai/analyze` endpoint checks `if model is None` and returns 503.
+- **Upsert pattern** — both `retinal_images` and `ai_results` use upsert (not insert) to allow re-upload and re-analysis without creating duplicate rows. Both require unique constraints in the DB: `(screening_session_id, eye_side)` and `(screening_session_id, eye)` respectively.
+- **Scheduler is always running** — `start_scheduler()` is called on every uvicorn startup event. The jobs poll every 1 minute. This is fine in dev but uses a persistent background thread.
+- **No file-based frontend build step needed in dev** — `npm run dev` serves the React app directly via Vite.
+- **Tailwind CSS** is used throughout the frontend (dark theme, `bg-[#0b0f14]` is the base background color).
+- **react-hot-toast** is used for all notifications (top-right, 4s, dark styled).

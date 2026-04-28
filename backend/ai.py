@@ -7,6 +7,7 @@ from PIL import Image
 from torchvision import models, transforms
 from torchvision.models import ResNet152_Weights
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel as PydanticBaseModel
 from uuid import UUID
 from typing import Dict, List
 import logging
@@ -509,6 +510,39 @@ def get_results_by_session(screening_session_id: UUID):
         )
 
 
+class AIResultOverride(PydanticBaseModel):
+    disease_detected: bool
+    disease_type: str
+    severity_label: str
+
+
+@router.patch("/result/{ai_result_id}")
+def override_ai_result(ai_result_id: str, body: AIResultOverride):
+    """
+    Allows a doctor to manually override the AI result for a single eye.
+    Nulls out confidence, referable, follow_up, llm_summary, and warnings.
+    Only updates disease_detected, disease_type, and severity_label.
+    """
+    existing = supabase.table("ai_results").select("id").eq("id", ai_result_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="AI result not found")
+
+    update_data = {
+        "disease_detected": body.disease_detected,
+        "disease_type": body.disease_type,
+        "severity_label": body.severity_label,
+        "dr_severity": None,
+        "referable": None,
+        "confidence_score": None,
+        "follow_up_interval": None,
+        "llm_summary": None,
+        "warnings": [],
+    }
+
+    supabase.table("ai_results").update(update_data).eq("id", ai_result_id).execute()
+    return {"ok": True, "message": "AI result updated"}
+
+
 @router.get("/health")
 def health_check():
     """
@@ -719,7 +753,10 @@ def generate_rag_summary(screening_session_id: UUID):
                 old_res = supabase.table("ai_results").select("eye, dr_severity").eq("screening_session_id", s['id']).execute()
                 s_date = s['session_date'][:10] if s['session_date'] else "Unknown"
                 if old_res.data:
-                    res_summary = ", ".join([f"{r['eye'].capitalize()}: {r['dr_severity'].capitalize()}" for r in old_res.data])
+                    res_summary = ", ".join([
+                        f"{(r.get('eye') or '').capitalize()}: {(r.get('dr_severity') or r.get('severity_label') or 'none').capitalize()}"
+                        for r in old_res.data
+                    ])
                     past_lines.append(f"- {s_date}: {res_summary}")
                 else:
                     past_lines.append(f"- {s_date}: No AI results recorded")
@@ -743,16 +780,17 @@ def generate_rag_summary(screening_session_id: UUID):
         
         diagnostic_lines = []
         for result in ai_res.data:
-            eye = result['eye'].capitalize()
-            severity = result['dr_severity']
-            confidence = result['confidence_score']
-            
+            eye = (result.get('eye') or '').capitalize()
+            severity = result.get('dr_severity') or result.get('severity_label') or 'none'
+            confidence = result.get('confidence_score') or 0.0
+
             current_score = severity_levels.get(severity.lower(), 0)
             if current_score > worst_severity_score:
                 worst_severity_score = current_score
                 worst_condition_name = severity
 
-            label = severity.capitalize() if severity.lower() in ['cataract', 'glaucoma'] else f"{severity.capitalize()} DR"
+            severity_lower = severity.lower()
+            label = severity.capitalize() if severity_lower in ['cataract', 'glaucoma'] else f"{severity.capitalize()} DR"
             diagnostic_lines.append(
                 f"- **{eye} Eye**: Prediction: {label} | Confidence: {confidence:.1%}"
             )
@@ -903,7 +941,7 @@ def evaluate_rag(screening_session_id: UUID):
         worst_condition_name = "No DR"
 
         for result in ai_res.data:
-            severity = result['dr_severity']
+            severity = result.get('dr_severity') or result.get('severity_label') or 'none'
             current_score = severity_levels.get(severity.lower(), 0)
             if current_score > worst_severity_score:
                 worst_severity_score = current_score

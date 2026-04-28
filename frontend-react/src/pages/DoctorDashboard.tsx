@@ -241,9 +241,24 @@ function InboxView({
   );
 }
 
-// ─── Sub-view: Doctor Review ──────────────────────────────────────────────────
+// ─── Severity options helper ─────────────────────────────────────────────────
 
-const DR_GRADES = ['', 'No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative', 'Ungradable'];
+function getSeverityOptions(diseaseType: string, diseaseDetected: string): string[] {
+  if (diseaseDetected === 'No') return ['N/A'];
+  switch (diseaseType) {
+    case 'Diabetic Retinopathy':
+      return ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative'];
+    case 'Cataract':
+      return ['Mild Cataract', 'Moderate Cataract', 'Severe Cataract'];
+    case 'Glaucoma':
+      return ['Suspect', 'Mild Glaucoma', 'Moderate Glaucoma', 'Severe Glaucoma'];
+    case 'N/A':
+    default:
+      return ['N/A'];
+  }
+}
+
+// ─── Sub-view: Doctor Review ──────────────────────────────────────────────────
 
 function ReviewView({
   sessionId,
@@ -270,12 +285,42 @@ function ReviewView({
   const [showSendConfirm, setShowSendConfirm] = useState(false);
   const [sendingReport, setSendingReport] = useState(false);
 
-  // Override modal state
-  const [showOverride, setShowOverride] = useState(false);
-  const [overrideReason, setOverrideReason] = useState('');
-  const [finalLeft, setFinalLeft] = useState('');
-  const [finalRight, setFinalRight] = useState('');
+  // Override modal state (legacy — kept for submitting flag)
   const [submitting, setSubmitting] = useState(false);
+
+  // Per-eye edit mode
+  const [leftEditing, setLeftEditing] = useState(false);
+  const [rightEditing, setRightEditing] = useState(false);
+
+  // Per-eye confirmed (true once doctor has confirmed the edit)
+  const [leftEdited, setLeftEdited] = useState(false);
+  const [rightEdited, setRightEdited] = useState(false);
+
+  // Per-eye form values while in edit mode
+  const [leftEditForm, setLeftEditForm] = useState({
+    disease_detected: 'Yes',
+    disease_type: 'Diabetic Retinopathy',
+    severity: 'No DR',
+  });
+  const [rightEditForm, setRightEditForm] = useState({
+    disease_detected: 'Yes',
+    disease_type: 'Diabetic Retinopathy',
+    severity: 'No DR',
+  });
+
+  // Confirmed override values (used when submitting the doctor review)
+  const [leftConfirmed, setLeftConfirmed] = useState<{
+    disease_type: string;
+    severity: string;
+  } | null>(null);
+  const [rightConfirmed, setRightConfirmed] = useState<{
+    disease_type: string;
+    severity: string;
+  } | null>(null);
+
+  // Override confirmation modal
+  const [showOverrideConfirm, setShowOverrideConfirm] = useState(false);
+  const [pendingConfirmEye, setPendingConfirmEye] = useState<'left' | 'right' | null>(null);
 
   const load = async () => {
     try {
@@ -299,7 +344,20 @@ function ReviewView({
     }
   };
 
-  useEffect(() => { load(); }, [sessionId, refreshKey]);
+  useEffect(() => {
+    load();
+    // Reset edit state when session changes
+    setLeftEditing(false);
+    setRightEditing(false);
+    setLeftEdited(false);
+    setRightEdited(false);
+    setLeftEditForm({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
+    setRightEditForm({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
+    setLeftConfirmed(null);
+    setRightConfirmed(null);
+    setShowOverrideConfirm(false);
+    setPendingConfirmEye(null);
+  }, [sessionId, refreshKey]);
 
   const status = (session?.status ?? '').toLowerCase();
   const isLocked = ['approved', 'overridden'].includes(status);
@@ -323,24 +381,117 @@ function ReviewView({
     }
   };
 
-  const handleOverride = async () => {
-    if (!overrideReason.trim()) {
-      toast.error('Override reason is required.');
+  const handleEnterEditMode = (eye: 'left' | 'right') => {
+    const result = aiResults.find(
+      (r) => getEyeSide(r as unknown as Record<string, unknown>) === eye
+    );
+    if (!result) return;
+
+    const diseaseDetected = result.disease_detected ? 'Yes' : 'No';
+    const diseaseType = result.disease_type ?? 'Diabetic Retinopathy';
+    const severityOptions = getSeverityOptions(diseaseType, diseaseDetected);
+    const severity = result.severity_label ?? severityOptions[0];
+
+    const formValue = { disease_detected: diseaseDetected, disease_type: diseaseType, severity };
+
+    if (eye === 'left') {
+      setLeftEditForm(formValue);
+      setLeftEditing(true);
+    } else {
+      setRightEditForm(formValue);
+      setRightEditing(true);
+    }
+  };
+
+  const handleEditConfirm = (eye: 'left' | 'right') => {
+    setPendingConfirmEye(eye);
+    setShowOverrideConfirm(true);
+  };
+
+  const handleOverrideConfirmed = async () => {
+    const eye = pendingConfirmEye;
+    if (!eye) return;
+    setShowOverrideConfirm(false);
+    setPendingConfirmEye(null);
+
+    const form = eye === 'left' ? leftEditForm : rightEditForm;
+    const result = aiResults.find(
+      (r) => getEyeSide(r as unknown as Record<string, unknown>) === eye
+    );
+    if (!result || !result.id) {
+      toast.error(`No AI result found for ${eye} eye`);
       return;
     }
+
+    try {
+      await aiAPI.overrideAiResult(result.id, {
+        disease_detected: form.disease_detected === 'Yes',
+        disease_type: form.disease_type,
+        severity_label: form.severity,
+      });
+
+      setAiResults((prev) =>
+        prev.map((r) => {
+          if (getEyeSide(r as unknown as Record<string, unknown>) === eye) {
+            return {
+              ...r,
+              disease_detected: form.disease_detected === 'Yes',
+              disease_type: form.disease_type,
+              severity_label: form.severity,
+              referable: undefined as unknown as boolean,
+              confidence_score: undefined as unknown as number,
+              follow_up_interval: undefined as unknown as string,
+              llm_summary: undefined as unknown as string,
+              warnings: [],
+            };
+          }
+          return r;
+        })
+      );
+
+      if (eye === 'left') {
+        setLeftEditing(false);
+        setLeftEdited(true);
+        setLeftConfirmed({ disease_type: form.disease_type, severity: form.severity });
+      } else {
+        setRightEditing(false);
+        setRightEdited(true);
+        setRightConfirmed({ disease_type: form.disease_type, severity: form.severity });
+      }
+
+      toast.success(`${eye.charAt(0).toUpperCase() + eye.slice(1)} eye result updated`);
+    } catch {
+      toast.error(`Failed to update ${eye} eye result`);
+    }
+  };
+
+  const handleSubmit = async () => {
+    const leftResult = aiResults.find(
+      (r) => getEyeSide(r as unknown as Record<string, unknown>) === 'left'
+    );
+    const rightResult = aiResults.find(
+      (r) => getEyeSide(r as unknown as Record<string, unknown>) === 'right'
+    );
+
+    const finalGradeLeft =
+      leftConfirmed?.severity ?? leftResult?.severity_label ?? leftResult?.dr_severity ?? null;
+    const finalGradeRight =
+      rightConfirmed?.severity ?? rightResult?.severity_label ?? rightResult?.dr_severity ?? null;
+
     setSubmitting(true);
     try {
       await screeningsAPI.submitReview(sessionId, {
         doctor_id: user.user_id,
         decision: 'overridden',
-        override_reason: overrideReason.trim(),
-        final_dr_grade_left: finalLeft || '',
-        final_dr_grade_right: finalRight || '',
+        override_reason: 'Doctor manually edited AI results for one or more eyes.',
+        final_dr_grade_left: finalGradeLeft ?? undefined,
+        final_dr_grade_right: finalGradeRight ?? undefined,
       });
-      toast.success('Overridden. Session is now locked.');
+
+      toast.success('Session submitted successfully');
       onBack();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Override failed.');
+    } catch {
+      toast.error('Failed to submit session');
     } finally {
       setSubmitting(false);
     }
@@ -408,28 +559,6 @@ function ReviewView({
 
       <hr style={{ borderColor: '#e5e7eb', margin: '16px 0' }} />
 
-      {/* Retinal images (view only) */}
-      <h3 className="text-base font-bold text-gray-900 mb-3">Retinal Images (View Only)</h3>
-      <div className="grid grid-cols-2 gap-4 mb-4">
-        {(['left', 'right'] as const).map(side => {
-          const img = side === 'left' ? leftImg : rightImg;
-          return (
-            <div key={side} style={elevatedCardStyle}>
-              <p className="text-sm font-bold text-gray-900 mb-2">{side === 'left' ? 'Left' : 'Right'} Eye</p>
-              {img ? (
-                <img src={img.image_url} alt={`${side} eye`} className="w-full rounded-lg" style={{ maxHeight: 220, objectFit: 'cover' }} />
-              ) : (
-                <div className="rounded-lg flex items-center justify-center text-sm text-gray-400" style={{ height: 140, background: '#f9fafb' }}>
-                  No image for this session
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      <hr style={{ borderColor: '#e5e7eb', margin: '16px 0' }} />
-
       {/* AI Verdict */}
       <h3 className="text-base font-bold text-gray-900 mb-1">AI Verdict</h3>
       {!hasResults && (
@@ -449,10 +578,253 @@ function ReviewView({
           <div className="flex justify-end mb-3">
             <HeatmapToggle value={showHeatmap} onChange={setShowHeatmap} />
           </div>
-          {/* Stats only */}
+          {/* Stats / Edit widgets */}
           <div className="grid grid-cols-2 gap-4 mb-3">
-            <div style={elevatedCardStyle}><EyePanel title="Left Eye Diagnosis" result={leftRes} originalImg={leftImg} showHeatmap={showHeatmap} section="stats" /></div>
-            <div style={elevatedCardStyle}><EyePanel title="Right Eye Diagnosis" result={rightRes} originalImg={rightImg} showHeatmap={showHeatmap} section="stats" /></div>
+            {/* ── Left Eye Widget ── */}
+            <div style={elevatedCardStyle}>
+              {leftEditing ? (
+                /* STATE 2 — Edit mode */
+                <div>
+                  <h4 className="text-sm font-bold text-gray-900 mb-3">Left Eye Diagnosis — Edit</h4>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Detected</label>
+                      <select
+                        value={leftEditForm.disease_detected}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setLeftEditForm((prev) => ({
+                            ...prev,
+                            disease_detected: val,
+                            disease_type: val === 'No' ? 'N/A' : prev.disease_type,
+                            severity: getSeverityOptions(val === 'No' ? 'N/A' : prev.disease_type, val)[0],
+                          }));
+                        }}
+                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
+                        style={inputStyle}
+                      >
+                        <option>Yes</option>
+                        <option>No</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Type</label>
+                      <select
+                        value={leftEditForm.disease_type}
+                        disabled={leftEditForm.disease_detected === 'No'}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setLeftEditForm((prev) => ({
+                            ...prev,
+                            disease_type: val,
+                            severity: getSeverityOptions(val, prev.disease_detected)[0],
+                          }));
+                        }}
+                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer disabled:opacity-50"
+                        style={inputStyle}
+                      >
+                        <option>Diabetic Retinopathy</option>
+                        <option>Cataract</option>
+                        <option>Glaucoma</option>
+                        <option>N/A</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500 block mb-1">Severity</label>
+                      <select
+                        value={leftEditForm.severity}
+                        onChange={(e) =>
+                          setLeftEditForm((prev) => ({ ...prev, severity: e.target.value }))
+                        }
+                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
+                        style={inputStyle}
+                      >
+                        {getSeverityOptions(leftEditForm.disease_type, leftEditForm.disease_detected).map((opt) => (
+                          <option key={opt}>{opt}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        onClick={() => setLeftEditing(false)}
+                        className="flex-1 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
+                        style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => handleEditConfirm('left')}
+                        className="flex-1 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
+                        style={{ background: '#f97316' }}
+                      >
+                        Confirm
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : leftEdited ? (
+                /* STATE 3 — Post-confirm collapsed display */
+                <div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <h4 className="text-sm font-bold text-gray-900">Left Eye Diagnosis</h4>
+                    <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-semibold">Doctor Edited</span>
+                  </div>
+                  <div className="space-y-1 text-sm text-gray-600">
+                    <p><span className="font-semibold text-gray-900">Disease Detected:</span> {leftRes?.disease_detected ? 'Yes' : 'No'}</p>
+                    <p><span className="font-semibold text-gray-900">Disease Type:</span> {leftRes?.disease_type ?? '-'}</p>
+                    <p><span className="font-semibold text-gray-900">Severity:</span> {leftRes?.severity_label ?? '-'}</p>
+                  </div>
+                </div>
+              ) : (
+                /* STATE 1 — Normal display */
+                <div className="relative">
+                  {!isLocked && (
+                    <button
+                      onClick={() => ragResult ? handleEnterEditMode('left') : undefined}
+                      disabled={!ragResult}
+                      title={!ragResult ? 'Generate Clinical Report Summary first' : undefined}
+                      className={`absolute top-0 right-0 text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 ${
+                        ragResult
+                          ? 'cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110'
+                          : 'cursor-not-allowed opacity-40 grayscale'
+                      }`}
+                      style={ragResult ? {
+                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
+                        boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
+                      } : {
+                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
+                      }}
+                    >
+                      Edit
+                    </button>
+                  )}
+                  <EyePanel title="Left Eye Diagnosis" result={leftRes} originalImg={leftImg} showHeatmap={showHeatmap} section="stats" />
+                </div>
+              )}
+            </div>
+
+            {/* ── Right Eye Widget ── */}
+            <div style={elevatedCardStyle}>
+              {rightEditing ? (
+                /* STATE 2 — Edit mode */
+                <div>
+                  <h4 className="text-sm font-bold text-gray-900 mb-3">Right Eye Diagnosis — Edit</h4>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Detected</label>
+                      <select
+                        value={rightEditForm.disease_detected}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setRightEditForm((prev) => ({
+                            ...prev,
+                            disease_detected: val,
+                            disease_type: val === 'No' ? 'N/A' : prev.disease_type,
+                            severity: getSeverityOptions(val === 'No' ? 'N/A' : prev.disease_type, val)[0],
+                          }));
+                        }}
+                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
+                        style={inputStyle}
+                      >
+                        <option>Yes</option>
+                        <option>No</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Type</label>
+                      <select
+                        value={rightEditForm.disease_type}
+                        disabled={rightEditForm.disease_detected === 'No'}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setRightEditForm((prev) => ({
+                            ...prev,
+                            disease_type: val,
+                            severity: getSeverityOptions(val, prev.disease_detected)[0],
+                          }));
+                        }}
+                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer disabled:opacity-50"
+                        style={inputStyle}
+                      >
+                        <option>Diabetic Retinopathy</option>
+                        <option>Cataract</option>
+                        <option>Glaucoma</option>
+                        <option>N/A</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-gray-500 block mb-1">Severity</label>
+                      <select
+                        value={rightEditForm.severity}
+                        onChange={(e) =>
+                          setRightEditForm((prev) => ({ ...prev, severity: e.target.value }))
+                        }
+                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
+                        style={inputStyle}
+                      >
+                        {getSeverityOptions(rightEditForm.disease_type, rightEditForm.disease_detected).map((opt) => (
+                          <option key={opt}>{opt}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        onClick={() => setRightEditing(false)}
+                        className="flex-1 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
+                        style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => handleEditConfirm('right')}
+                        className="flex-1 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
+                        style={{ background: '#f97316' }}
+                      >
+                        Confirm
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : rightEdited ? (
+                /* STATE 3 — Post-confirm collapsed display */
+                <div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <h4 className="text-sm font-bold text-gray-900">Right Eye Diagnosis</h4>
+                    <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-semibold">Doctor Edited</span>
+                  </div>
+                  <div className="space-y-1 text-sm text-gray-600">
+                    <p><span className="font-semibold text-gray-900">Disease Detected:</span> {rightRes?.disease_detected ? 'Yes' : 'No'}</p>
+                    <p><span className="font-semibold text-gray-900">Disease Type:</span> {rightRes?.disease_type ?? '-'}</p>
+                    <p><span className="font-semibold text-gray-900">Severity:</span> {rightRes?.severity_label ?? '-'}</p>
+                  </div>
+                </div>
+              ) : (
+                /* STATE 1 — Normal display */
+                <div className="relative">
+                  {!isLocked && (
+                    <button
+                      onClick={() => ragResult ? handleEnterEditMode('right') : undefined}
+                      disabled={!ragResult}
+                      title={!ragResult ? 'Generate Clinical Report Summary first' : undefined}
+                      className={`absolute top-0 right-0 text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 ${
+                        ragResult
+                          ? 'cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110'
+                          : 'cursor-not-allowed opacity-40 grayscale'
+                      }`}
+                      style={ragResult ? {
+                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
+                        boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
+                      } : {
+                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
+                      }}
+                    >
+                      Edit
+                    </button>
+                  )}
+                  <EyePanel title="Right Eye Diagnosis" result={rightRes} originalImg={rightImg} showHeatmap={showHeatmap} section="stats" />
+                </div>
+              )}
+            </div>
           </div>
         </>
       )}
@@ -484,13 +856,13 @@ function ReviewView({
           className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
           style={{ background: '#7c3aed', boxShadow: '0 8px 28px rgba(124,58,237,0.45)' }}
         >
-          🧠 {ragLoading ? 'Generating…' : 'Generate Clinical Research Summary'}
+          🧠 {ragLoading ? 'Generating…' : 'Generate Clinical Report Summary'}
         </button>
         {!hasResults && (
           <p className="mt-2 text-sm text-gray-500 text-center">AI results are required before generating a summary.</p>
         )}
         {hasResults && !isLocked && !ragResult && (
-          <p className="mt-2 text-sm text-gray-500 text-center">Generate summary to unlock Approve and Override options.</p>
+          <p className="mt-2 text-sm text-gray-500 text-center">Generate this Report Summary to unlock Approve and Override (edit) options.</p>
         )}
       </div>
 
@@ -533,22 +905,25 @@ function ReviewView({
           <hr style={{ borderColor: '#e5e7eb', margin: '16px 0' }} />
           <h3 className="text-lg font-semibold text-gray-900 mt-8 mb-4">Doctor Actions</h3>
           <div className="flex flex-wrap justify-center gap-4 mb-6">
-            <button
-              onClick={handleApprove}
-              disabled={isLocked || !hasResults || submitting}
-              className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-              style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}
-            >
-              ✅ Approve
-            </button>
-            <button
-              onClick={() => setShowOverride(true)}
-              disabled={isLocked || !hasResults}
-              className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-              style={{ boxShadow: '0 8px 24px rgba(249,115,22,0.45)' }}
-            >
-              ✍️ Override / Edit
-            </button>
+            {(leftEdited || rightEdited) ? (
+              <button
+                onClick={handleSubmit}
+                disabled={isLocked || !hasResults || submitting}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
+                style={{ boxShadow: '0 8px 24px rgba(249,115,22,0.45)' }}
+              >
+                {submitting ? 'Submitting…' : '✍️ Submit'}
+              </button>
+            ) : (
+              <button
+                onClick={handleApprove}
+                disabled={isLocked || !hasResults || submitting}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
+                style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}
+              >
+                ✅ Approve
+              </button>
+            )}
             {ragResult && (
               <button
                 onClick={() => {
@@ -602,60 +977,39 @@ function ReviewView({
         </div>
       )}
 
-      {/* Override Modal */}
-      {showOverride && (
+      {/* Override Confirmation Modal */}
+      {showOverrideConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
-          <div className="w-full max-w-lg mx-4 p-6 rounded-2xl" style={{ background: '#fff', border: '1px solid #e5e7eb', boxShadow: '0 8px 32px rgba(0,0,0,0.12)' }}>
-            <h3 className="text-lg font-bold text-gray-900 mb-1">Override / Edit Decision</h3>
-            <p className="text-xs mb-4" style={{ color: '#ea580c' }}>
-              Override will lock the session as 'overridden'. Reason is required.
-            </p>
-
-            <label className="text-xs mb-1 block text-gray-500">Override reason (required)</label>
-            <textarea
-              rows={3}
-              placeholder="Explain why you're overriding the AI result…"
-              value={overrideReason}
-              onChange={e => setOverrideReason(e.target.value)}
-              className="w-full px-3 py-2.5 rounded-xl text-sm outline-none resize-none mb-4"
-              style={inputStyle}
-            />
-
-            <div className="grid grid-cols-2 gap-3 mb-4">
-              <div>
-                <label className="text-xs mb-1 block text-gray-500">Final Grade (Left Eye) — optional</label>
-                <select className="w-full px-3 py-2.5 rounded-xl text-sm outline-none cursor-pointer" style={inputStyle} value={finalLeft} onChange={e => setFinalLeft(e.target.value)}>
-                  {DR_GRADES.map(g => <option key={g} value={g}>{g || 'Select grade'}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs mb-1 block text-gray-500">Final Grade (Right Eye) — optional</label>
-                <select className="w-full px-3 py-2.5 rounded-xl text-sm outline-none cursor-pointer" style={inputStyle} value={finalRight} onChange={e => setFinalRight(e.target.value)}>
-                  {DR_GRADES.map(g => <option key={g} value={g}>{g || 'Select grade'}</option>)}
-                </select>
-              </div>
+          <div className="w-full max-w-sm mx-4 p-6 rounded-2xl bg-white" style={{ boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}>
+            <div className="flex items-center gap-3 mb-3">
+              <span className="text-2xl">✍️</span>
+              <h3 className="text-lg font-bold text-gray-900">Confirm Override</h3>
             </div>
-
+            <p className="text-sm text-gray-500 mb-1">You are about to override the AI result for:</p>
+            <p className="text-sm font-bold text-gray-900 mb-4">
+              {pendingConfirmEye === 'left' ? 'Left Eye' : 'Right Eye'}
+            </p>
+            <p className="text-xs text-gray-400 mb-5">This will permanently replace the AI result. This action cannot be undone.</p>
             <div className="flex gap-3">
               <button
-                onClick={handleOverride}
-                disabled={submitting}
-                className="flex-1 py-2.5 rounded-xl font-bold text-white text-sm disabled:opacity-60 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-                style={{ background: '#f97316' }}
-              >
-                {submitting ? 'Submitting…' : '✍️ Confirm Override'}
-              </button>
-              <button
-                onClick={() => setShowOverride(false)}
-                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+                onClick={() => { setShowOverrideConfirm(false); setPendingConfirmEye(null); }}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
                 style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
               >
                 Cancel
+              </button>
+              <button
+                onClick={handleOverrideConfirmed}
+                className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
+                style={{ background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' }}
+              >
+                Confirm Override
               </button>
             </div>
           </div>
         </div>
       )}
+
     </div>
   );
 }
@@ -1094,7 +1448,6 @@ export default function DoctorDashboard() {
                   {patientName} — Session #{String(sessionNo)}
                   {isFinalized && <span className="ml-1.5 text-gray-400">(view)</span>}
                 </button>
-                <p className="text-xs px-3 text-gray-400">Status: {s.status}</p>
               </div>
             );
           })}
@@ -1152,17 +1505,9 @@ export default function DoctorDashboard() {
             <>
               <button
                 onClick={() => setView({ name: 'inbox' })}
-                className="ml-3 text-sm text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+                className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
               >
                 ← Back to Inbox
-              </button>
-              <button
-                onClick={() => setReviewRefreshKey(k => k + 1)}
-                className="p-1.5 rounded-lg text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-                style={{ background: '#f3f4f6' }}
-                title="Refresh"
-              >
-                <RefreshCw size={13} />
               </button>
             </>
           )}

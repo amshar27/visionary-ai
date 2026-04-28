@@ -96,6 +96,16 @@ export default function Login() {
             </button>
           </div>
 
+          <div className="text-right mt-1">
+            <button
+              onClick={() => navigate('/forgot-password')}
+              className="text-sm text-blue-600 hover:text-blue-500 cursor-pointer transition-colors duration-200"
+              type="button"
+            >
+              Forgot password?
+            </button>
+          </div>
+
           <button
             type="submit"
             disabled={loading}

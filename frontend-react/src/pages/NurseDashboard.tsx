@@ -1566,7 +1566,6 @@ export default function NurseDashboard() {
               >
                 {p.name}
               </button>
-              <p className="text-xs px-3 text-gray-400">IC: {p.ic_passport}</p>
             </div>
           ))}
         </div>
@@ -1622,7 +1621,7 @@ export default function NurseDashboard() {
           {(view.name === 'workspace' || view.name === 'appointments' || view.name === 'new-patient') && (
             <button
               onClick={() => setView({ name: 'home' })}
-              className="ml-3 text-sm text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+              className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
             >
               ← Back to Patients
             </button>
@@ -1630,7 +1629,7 @@ export default function NurseDashboard() {
           {view.name === 'session' && (
             <button
               onClick={() => setView({ name: 'workspace', patient: view.patient })}
-              className="ml-3 text-sm text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+              className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
             >
               ← Back to Workspace
             </button>

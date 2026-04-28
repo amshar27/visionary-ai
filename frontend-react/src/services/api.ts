@@ -67,6 +67,15 @@ export const authAPI = {
 
   register: (data: RegisterRequest) =>
     api.post<AuthResponse>('/auth/register', data).then((r) => r.data),
+
+  forgotPassword: (email: string) =>
+    api.post('/auth/forgot-password', { email }).then((r) => r.data),
+
+  verifyOtp: (email: string, otp_code: string) =>
+    api.post('/auth/verify-otp', { email, otp_code }).then((r) => r.data),
+
+  resetPassword: (email: string, new_password: string) =>
+    api.post('/auth/reset-password', { email, new_password }).then((r) => r.data),
 };
 
 // ─── Patients API ─────────────────────────────────────────────────────────────
@@ -207,6 +216,18 @@ export const aiAPI = {
 
   getRagSummary: (sessionId: string) =>
     api.get<{ rag_summary: string | null }>(`/ai/rag-summary/${sessionId}`).then((r) => r.data),
+
+  overrideAiResult: async (
+    aiResultId: string,
+    data: {
+      disease_detected: boolean;
+      disease_type: string;
+      severity_label: string;
+    }
+  ) => {
+    const res = await api.patch(`/ai/result/${aiResultId}`, data);
+    return res.data;
+  },
 
   health: () =>
     api.get<AIHealthResponse>('/ai/health').then((r) => r.data),

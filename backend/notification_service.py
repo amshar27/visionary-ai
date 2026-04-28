@@ -165,3 +165,33 @@ def send_clinical_report(
     except Exception as e:
         print(f"[notification_service] Failed to send clinical report to {patient_email}: {e}")
         return False
+
+
+def send_otp_email(to_email: str, to_name: str, otp_code: str) -> bool:
+    """Send OTP code for password reset."""
+    try:
+        resend.Emails.send({
+            "from": "Visionary AI <onboarding@resend.dev>",
+            "to": [to_email],
+            "subject": "Your Password Reset Code \u2013 Visionary AI",
+            "html": f"""
+            <div style="font-family: 'Segoe UI', sans-serif; background: #0b0f14; color: #e2e8f0; padding: 40px; border-radius: 12px; max-width: 500px; margin: 0 auto;">
+              <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="color: #60a5fa; font-size: 24px; margin: 0;">Visionary AI</h1>
+                <p style="color: #94a3b8; margin-top: 8px;">Password Reset Request</p>
+              </div>
+              <p style="color: #e2e8f0;">Hello <strong>{to_name}</strong>,</p>
+              <p style="color: #94a3b8;">Use the code below to reset your password. This code expires in <strong style="color: #f59e0b;">10 minutes</strong>.</p>
+              <div style="background: #1e293b; border: 2px solid #3b82f6; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0;">
+                <span style="font-size: 36px; font-weight: 700; letter-spacing: 12px; color: #60a5fa; font-family: monospace;">{otp_code}</span>
+              </div>
+              <p style="color: #64748b; font-size: 13px;">If you did not request this, please ignore this email. Your password will not change.</p>
+              <hr style="border-color: #1e293b; margin: 24px 0;">
+              <p style="color: #475569; font-size: 12px; text-align: center;">Visionary AI — Clinical Eye Screening System</p>
+            </div>
+            """
+        })
+        return True
+    except Exception as e:
+        print(f"[OTP email error] {e}")
+        return False
