@@ -92,9 +92,9 @@ visionary_ai/
     │   │   ├── Login.tsx         # email/password form + "Forgot password?" link
     │   │   ├── Register.tsx      # staff_id + email + password (validated against registry)
     │   │   ├── ForgotPassword.tsx  # 4-step OTP password reset (email → OTP → new pw → success)
-    │   │   ├── NurseDashboard.tsx  # 4 sub-views: search, new-patient, workspace, session
-    │   │   ├── DoctorDashboard.tsx # 2 sub-views: inbox, review (RAG + override modal)
-    │   │   └── AdminDashboard.tsx  # top navbar + 2 tabs: staff users, patients
+    │   │   ├── NurseDashboard.tsx  # 5 sub-views: home, new-patient, workspace, session, appointments
+    │   │   ├── DoctorDashboard.tsx # 3 sub-views: inbox, review (inline edit), appointments
+    │   │   └── AdminDashboard.tsx  # top navbar + 2 tabs: users (staff), patients
     │   ├── services/
     │   │   └── api.ts            # Axios instance (baseURL: http://localhost:8000) + all API fns
     │   ├── types/
@@ -109,7 +109,7 @@ visionary_ai/
 ## Backend Modules
 
 ### `main.py`
-FastAPI app. Registers all routers and calls `start_scheduler()` on startup. CORS is configured here.
+FastAPI app. Registers all routers (auth, patients, screenings, uploads, ai, staff, admin, appointments, **auth_reset**) and calls `start_scheduler()` on the `startup` event. CORS is configured here. Also exposes `GET /` (health) and `GET /db-test` (Supabase connectivity smoke test, returns `{ok, data}` or `{ok: false, error}`).
 
 ### `db.py`
 Creates the global `supabase` client using `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`. Uses `ClientOptions(storage_client_timeout=120)`.
@@ -141,24 +141,25 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `GET /screenings/assigned-to/{doctor_id}` — enriched inbox (joins patient name + nurse name)
 - `GET /screenings/{id}` — single session (joins patient)
 - `GET /screenings/{id}/doctor-review/latest` — most recent doctor_reviews row
-- `POST /screenings/{id}/doctor-review` — inserts review, updates session status to approved/overridden
+- `POST /screenings/{id}/doctor-review` — inserts review, updates session status to approved/overridden. Blocked if status is already in `LOCKED_STATUSES` (`{approved, overridden}`). If `assigned_doctor_id` is set on the session, only that doctor may submit (returns 403 otherwise). When `decision="overridden"`, `override_reason` is required (returns 400 if missing/empty).
 - `POST /screenings/{id}/send-report` — converts markdown report to HTML, emails patient via Resend
 - `DELETE /screenings/{id}` — only deletes pending sessions with no uploads and no assigned doctor
 
 ### `uploads.py` — `/uploads`
-- `POST /uploads/retinal` — multipart upload to `retinal-scans` bucket; UPSERTS on `(screening_session_id, eye_side)` so re-uploading replaces rather than duplicates. Cleans up old storage object after replace.
-- `GET /uploads/retinal/by-session/{id}` — lists images for session (max 2: left + right), adds `image_url`
+- `POST /uploads/retinal` — multipart upload to `retinal-scans` bucket; UPSERTS on `(screening_session_id, eye_side)` so re-uploading replaces rather than duplicates. Saves both `image_path` and the public `image_url` to the DB row. Cleans up the old storage object after a successful replace.
+- `GET /uploads/retinal/by-session/{id}` — lists images for session (max 2: left + right). Recomputes `image_url` from `image_path` on every read (overwrites the stored value).
 
 ### `ai.py` — `/ai`
-- `POST /ai/analyze?screening_session_id=` — runs model on both eyes, generates Grad-CAM, upserts to `ai_results`, sets session status=analysed. Requires both left and right images. Blocked if session status is in `{assigned, approved, overridden}`.
-- `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use.
+- `POST /ai/analyze?screening_session_id=` — runs model on both eyes, generates Grad-CAM, uploads heatmaps to `retinal-scans/heatmaps/`, then upserts per-eye rows (with `heatmap_url`) into `ai_results` and sets session status=analysed. Requires both left and right images. Blocked if session status is in `LOCKED_STATUSES = {assigned, approved, overridden}`. The upsert dict includes: `screening_session_id, eye, disease_detected, dr_severity, referable, confidence_score, macular_involvement, llm_summary, follow_up_interval, warnings, class_probabilities, heatmap_url`. **Not** included: `predicted_class`, `disease_type`, `severity_label` — these are only ever set via doctor override (PATCH).
+- `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use. Not currently called by the frontend.
 - `GET /ai/results/by-session/{id}` — returns ai_results rows for session
-- `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, `warnings`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately).
-- `POST /ai/summarise-rag?screening_session_id=` — generates full RAG clinical report via a 2-step LLM pipeline: (1) gpt-4o-mini extracts/condenses guidelines from retrieved docs, (2) gpt-4o writes the final structured report. Fetches patient history, doctor name, past session history, current AI results, then queries `match_documents` RPC (threshold=0.45, count=5). Persists the report to `ai_results.rag_summary`. Defensively reads severity as `dr_severity or severity_label or 'none'` to handle doctor-overridden rows where `dr_severity` is null.
+- `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and sets `warnings` to `[]`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately). After this PATCH, `disease_type` and `severity_label` are the only fields carrying the doctor's diagnosis.
+- `POST /ai/summarise-rag?screening_session_id=` — generates full RAG clinical report via a 2-step LLM pipeline: (1) gpt-4o-mini extracts/condenses guidelines from retrieved docs, (2) gpt-4o writes the final structured report. Fetches patient history, doctor name, past session history, current AI results, then queries `match_documents` RPC (threshold=0.45, count=5). Search query is conditional: `"…for {condition} Malaysia"` for cataract/glaucoma, `"…for {condition} diabetic retinopathy Malaysia"` otherwise. Persists the report to `ai_results.rag_summary`. Defensively reads severity as `dr_severity or severity_label or 'none'` to handle doctor-overridden rows where `dr_severity` is null. **On any exception, returns `{rag_summary: "**Error generating report:** ...", references: []}` with HTTP 200 (does not raise)** — the frontend should check the body for an error prefix.
 - `GET /ai/rag-summary/{id}` — returns persisted rag_summary field from the first ai_results row for the session
-- `POST /ai/evaluate-rag/{screening_session_id}` — evaluates an existing RAG summary using RAGAS metrics (faithfulness, answer_relevancy, context_precision). Re-runs retrieval to build the evaluation dataset. Best-effort persists scores to `ai_results.ragas_scores`. Returns `{ok, session_id, condition, scores}`. Also reads severity defensively.
+- `POST /ai/evaluate-rag/{screening_session_id}` — evaluates an existing RAG summary using RAGAS metrics (faithfulness, answer_relevancy, and context_relevancy/context_utilization/ContextRelevance — selected via try/except at import time depending on the installed RAGAS version, see `_context_metric_name` log line). Re-runs retrieval to build the evaluation dataset. Best-effort persists scores to `ai_results.ragas_scores`. Returns `{ok, session_id, condition, scores}`. Reads severity defensively. **Not currently called by the frontend** — used via direct HTTP for FYP evaluation.
+- `GET /ai/rag-trace/{screening_session_id}` — read-only debug endpoint (no LLM calls, no DB writes) that re-runs only the RAG retrieval step. Returns `{session_id, condition, search_query, num_retrieved, retrieved_chunks: [{source, similarity, content_preview}], final_report}`. Used for FYP evaluation. ⚠️ Reads `result['dr_severity']` directly without the defensive `or severity_label` fallback (will raise `AttributeError: 'NoneType' object has no attribute 'lower'` on doctor-overridden rows). Not called by the frontend.
 - `GET /ai/health` — model load status + device + classes
-- `POST /ai/ingest-research?bucket_name=guidelines` — one-time ingestion of PDFs into vector store
+- `POST /ai/ingest-research?bucket_name=guidelines` — one-time ingestion of PDFs into vector store. `bucket_name` query param defaults to `"guidelines"`. Splits with chunk_size=1000, overlap=200.
 
 ### `staff.py` — `/staff`
 - `GET /staff/doctors` — lists staff_users with role=doctor (for nurse dropdown)
@@ -186,9 +187,9 @@ Resend email helpers (all fire-and-forget, return bool):
 - `send_otp_email(to_email, to_name, otp_code)` — dark-themed OTP email for password reset (10-min expiry)
 
 ### `scheduler.py`
-APScheduler runs two jobs every 1 minute:
-- `send_reminders()` — finds appointments 23h59m–24h01m away with no `notification_sent_at`, sends reminder, stamps field
-- `auto_no_show()` — marks scheduled appointments >30 min past their time as `no_show`
+APScheduler `BackgroundScheduler` runs two jobs every 1 minute (started from `main.py`'s `startup` event):
+- `send_reminders()` — finds `status="scheduled"` appointments with `appointment_datetime` between `now+23h59m` and `now+24h01m` and `notification_sent_at IS NULL`. Sends reminder via `send_appointment_reminder`, then stamps `notification_sent_at`. Skips appointments with no patient email.
+- `auto_no_show()` — marks `status="scheduled"` appointments whose `appointment_datetime` is more than 30 minutes in the past as `no_show`. Both timestamps are compared in UTC.
 
 ---
 
@@ -244,8 +245,9 @@ Unique constraint: `(screening_session_id, eye_side)` — enables UPSERT re-uplo
 ### `ai_results`
 `id, screening_session_id (FK), eye (not eye_side!), disease_detected, dr_severity, disease_type, severity_label, predicted_class, referable, confidence_score, macular_involvement, llm_summary, rag_summary, ragas_scores (jsonb), follow_up_interval, warnings (array), class_probabilities (jsonb), heatmap_url, created_at`
 Unique constraint: `(screening_session_id, eye)` — enables UPSERT re-analysis.
-Note: `predicted_class` exists in the DB schema but is **not currently written** by the `/ai/analyze` endpoint (the upsert dict omits it). It will be `null` unless set manually.
-Note: After a doctor inline override (`PATCH /ai/result/{id}`), `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and `warnings` are all set to null/empty. Only `disease_detected`, `disease_type`, and `severity_label` carry the doctor's values. Always read severity as `dr_severity or severity_label` defensively.
+Note: `predicted_class`, `disease_type`, and `severity_label` exist in the DB schema but are **not currently written** by `/ai/analyze` (the upsert dict omits them). `predicted_class` will always be `null`. `disease_type` and `severity_label` are only ever populated via doctor override (`PATCH /ai/result/{id}`).
+Note: `heatmap_url` is populated by `/ai/analyze` from the public URL of the uploaded Grad-CAM JPEG (`retinal-scans/heatmaps/heatmap_{session_id}_{eye}.jpg`). It is `null` only when heatmap generation/upload fails.
+Note: After a doctor inline override (`PATCH /ai/result/{id}`), `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary` are set to null and `warnings` to `[]`. Only `disease_detected`, `disease_type`, and `severity_label` carry the doctor's values. Always read severity as `dr_severity or severity_label or 'none'` defensively.
 
 ### `doctor_reviews`
 `id, screening_session_id (FK), doctor_id (FK), decision (approved|overridden), final_grade_left, final_grade_right, override_reason, report_url, reviewed_at`
@@ -295,17 +297,19 @@ Routes are in `App.tsx`. `ProtectedRoute` redirects unauthenticated users to `/l
 | `/doctor/*` | DoctorDashboard | doctor |
 | `/admin/*` | AdminDashboard | admin |
 
-### NurseDashboard — 4 sub-views
-1. **search** — search patients by name or IC/passport
+### NurseDashboard — 5 sub-views (`NurseView` discriminated union)
+1. **home** — search patients by name or IC/passport (default landing view)
 2. **new-patient** — register a new patient
 3. **workspace** — select patient, view/create screening sessions
 4. **session** — upload L/R images, trigger AI, assign to doctor, delete pending session
+5. **appointments** — calendar view (month/week/day toggle) of appointments scheduled by this nurse, plus booking flow
 
 Sidebar patient list shows patient name only (IC line removed).
 
-### DoctorDashboard — 2 sub-views
+### DoctorDashboard — 3 sub-views (`DoctorView` discriminated union)
 1. **inbox** — list sessions assigned to the logged-in doctor
 2. **review** — AI Verdict section with original/heatmap toggle (EyePanel), per-eye edit widgets, RAG report, and Approve or Submit button. Raw retinal images are **not** shown as a separate section — they are accessible only via the heatmap toggle within AI Verdict. The old Override modal has been removed.
+3. **appointments** — calendar view of appointments assigned to this doctor
 
 **Per-eye inline edit flow** (replaces the old Override button):
 - Each eye widget has an **Edit** button (visible when session is not locked).
@@ -316,8 +320,8 @@ Sidebar patient list shows patient name only (IC line removed).
 
 Sidebar session list shows patient name + session number only (Status line removed). Refresh button next to ← Back to Inbox has been removed.
 
-### AdminDashboard — 2 tabs
-1. **staff users** — list, rename, reset password, delete staff accounts
+### AdminDashboard — 2 tabs (internal values: `users`, `patients`)
+1. **users** ("Staff Users") — list, rename, reset password, delete staff accounts
 2. **patients** — list, update (name/IC/contact), delete patient records
 
 ---
@@ -368,7 +372,24 @@ After `PATCH /ai/result/{id}`, the `dr_severity` column is set to `null`. Any ba
 ```python
 severity = result.get('dr_severity') or result.get('severity_label') or 'none'
 ```
-This applies in `generate_rag_summary` and `evaluate_rag` in `ai.py` (already fixed). Apply the same pattern to any future code that reads `dr_severity` from `ai_results` rows.
+This applies in `generate_rag_summary` and `evaluate_rag` in `ai.py` (already fixed). **`rag_trace` (`GET /ai/rag-trace/{id}`) is NOT yet fixed** — it reads `result['dr_severity']` directly (`ai.py:1072`) and will crash on overridden rows. Apply the defensive pattern to any future code that reads `dr_severity` from `ai_results` rows.
+
+### Glaucoma/IOP column names — RAG reads wrong columns
+The `patients` table (and `PatientCreate` Pydantic model, `Patient` TypeScript interface, and Nurse form) uses these column names:
+- `glaucoma_family_history`
+- `elevated_iop_history`
+
+But `generate_rag_summary` in `ai.py:731,751,752` reads them as:
+- `family_history_glaucoma`
+- `elevated_iop`
+
+This means the RAG report **always shows "Unknown"** for these two fields, regardless of what the nurse entered. To fix, change the SELECT in `ai.py:731` to `glaucoma_family_history, elevated_iop_history` and update the corresponding `pt.get(...)` calls. (`previous_eye_surgery` and `visual_symptoms` are correctly named on both sides.)
+
+### `RetinalImage.created_at` vs `uploaded_at`
+The `retinal_images` table column is `uploaded_at` (set in `uploads.py:82`). The TypeScript `RetinalImage` interface declares `created_at: string` instead. Read defensively if you need the timestamp from this row.
+
+### Frontend coverage gaps
+- `aiAPI` does **not** expose `/ai/evaluate-rag`, `/ai/rag-trace`, or `/ai/reanalyze` — these are backend-only / FYP-evaluation endpoints called via direct HTTP (e.g. curl or test scripts), not from the React app.
 
 ---
 
@@ -390,7 +411,16 @@ All backend responses follow one of two shapes:
 { "ok": true, "message": "..." }        // action endpoints
 { "ok": false, "detail": "..." }        // error (HTTP 4xx/5xx)
 ```
-Exception: Appointments endpoints return the appointment object directly (no `ok` wrapper). `axios` interceptor in `api.ts` maps `error.response.data.detail` to a plain `Error`.
+Exceptions to the wrapper pattern:
+- **Appointments** endpoints return the appointment object directly (`AppointmentOut` model). `POST /appointments` returns HTTP 201.
+- **`POST /ai/summarise-rag`** returns `{rag_summary, references}` (no `ok`). On internal exceptions, returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:** "`.
+- **`GET /ai/rag-summary/{id}`** returns `{rag_summary: string | null}` (no `ok`).
+- **`POST /screenings/{id}/send-report`** returns `{success: true}`.
+- **`POST /ai/evaluate-rag/{id}`** returns `{ok, session_id, condition, scores}`.
+- **`GET /ai/rag-trace/{id}`** returns `{session_id, condition, search_query, num_retrieved, retrieved_chunks, final_report}` (no `ok`).
+- **`GET /ai/health`** returns `{ok, model_loaded, device, num_classes, classes}`.
+
+`axios` response interceptor in `api.ts` maps `error.response.data.detail` (or `.message`) to a plain `Error` — so frontend code can just `try { … } catch (e) { toast.error(e.message) }`.
 
 ---
 
