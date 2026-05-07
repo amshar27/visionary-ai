@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import io
+import math
 import requests
 from PIL import Image
 from torchvision import models, transforms
@@ -23,18 +24,36 @@ from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 # NEW IMPORTS FOR RAG
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI, ChatOpenAI as LCChatOpenAI
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from ragas import evaluate
-from ragas.metrics import faithfulness, answer_relevancy, context_precision
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+try:
+    from ragas.metrics import faithfulness, answer_relevancy, context_relevancy
+    _context_metric = context_relevancy
+    _context_metric_name = "context_relevancy"
+except ImportError:
+    try:
+        from ragas.metrics import faithfulness, answer_relevancy, context_utilization
+        _context_metric = context_utilization
+        _context_metric_name = "context_utilization"
+    except ImportError:
+        from ragas.metrics import faithfulness, answer_relevancy
+        from ragas.metrics import ContextRelevance
+        _context_metric = ContextRelevance()
+        _context_metric_name = "ContextRelevance"
 from datasets import Dataset
 
 
 client = OpenAI()      
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+# RAGAS-compatible wrappers
+ragas_llm = LangchainLLMWrapper(LCChatOpenAI(model="gpt-4o-mini", max_tokens=4000))
+ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
 # Initialize Vector Store
 vector_store = SupabaseVectorStore(
     client=supabase,
@@ -48,6 +67,7 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.info(f"RAGAS context metric selected: {_context_metric_name}")
 
 LOCKED_STATUSES = {"assigned", "approved", "overridden"}
 
@@ -980,10 +1000,24 @@ def evaluate_rag(screening_session_id: UUID):
 
         ragas_result = evaluate(
             dataset=ragas_dataset,
-            metrics=[faithfulness, answer_relevancy, context_precision],
+            metrics=[faithfulness, answer_relevancy, _context_metric],
+            llm=ragas_llm,
+            embeddings=ragas_embeddings,
         )
 
-        scores = {k: float(v) for k, v in ragas_result.items() if isinstance(v, (int, float))}
+        df = ragas_result.to_pandas()
+        scores = {}
+        for col in df.columns:
+            if col in ("question", "answer", "contexts", "reference", "ground_truth", "user_input", "response", "retrieved_contexts"):
+                continue
+            try:
+                val = float(df[col].mean())
+                if math.isnan(val) or math.isinf(val):
+                    scores[col] = None
+                else:
+                    scores[col] = val
+            except (ValueError, TypeError):
+                continue
 
         # --- STEP 6: Persist scores to ai_results (best-effort) ---
         try:
@@ -1006,3 +1040,86 @@ def evaluate_rag(screening_session_id: UUID):
     except Exception as e:
         logger.error(f"RAGAS evaluation failed: {e}")
         raise HTTPException(status_code=500, detail=f"RAGAS evaluation failed: {str(e)}")
+
+
+# ======================================================
+# RAG: TRACE / DEBUG ENDPOINT
+# ======================================================
+@router.get("/rag-trace/{screening_session_id}")
+def rag_trace(screening_session_id: UUID):
+    """
+    Read-only debug endpoint that re-runs only the RAG retrieval step
+    (no LLM calls, no DB writes) and returns trace data for FYP evaluation.
+    """
+    try:
+        # --- STEP 1: Fetch AI results ---
+        ai_res = (
+            supabase.table("ai_results")
+            .select("*")
+            .eq("screening_session_id", str(screening_session_id))
+            .execute()
+        )
+
+        if not ai_res.data:
+            raise HTTPException(status_code=404, detail="No AI results found for this session.")
+
+        # --- STEP 2: Determine worst severity (same logic as summarise-rag / evaluate-rag) ---
+        severity_levels = {'none': 0, 'mild': 1, 'moderate': 2, 'severe': 3, 'proliferative': 4}
+        worst_severity_score = -1
+        worst_condition_name = "No DR"
+
+        for result in ai_res.data:
+            severity = result['dr_severity']
+            current_score = severity_levels.get(severity.lower(), 0)
+            if current_score > worst_severity_score:
+                worst_severity_score = current_score
+                worst_condition_name = severity
+
+        # --- STEP 3: Rebuild search query (same conditional as existing endpoints) ---
+        if worst_condition_name.lower() in ['cataract', 'glaucoma']:
+            search_query = f"management and referral guidelines for {worst_condition_name} Malaysia"
+        else:
+            search_query = f"management and referral guidelines for {worst_condition_name} diabetic retinopathy Malaysia"
+
+        # --- STEP 4: Embed query and call match_documents RPC ---
+        query_vector = embeddings.embed_query(search_query)
+
+        rpc_response = supabase.rpc(
+            "match_documents",
+            {
+                "query_embedding": query_vector,
+                "match_threshold": 0.45,
+                "match_count": 5
+            }
+        ).execute()
+
+        retrieved_docs = rpc_response.data or []
+
+        # --- STEP 5: Build retrieved_chunks with content preview ---
+        retrieved_chunks = []
+        for doc in retrieved_docs:
+            content = doc.get("content", "")
+            preview = content[:300] + "..." if len(content) > 300 else content
+            retrieved_chunks.append({
+                "source": doc.get("metadata", {}).get("source", "Unknown"),
+                "similarity": doc.get("similarity", None),
+                "content_preview": preview
+            })
+
+        # --- STEP 6: Get existing rag_summary (if any) ---
+        final_report = ai_res.data[0].get("rag_summary")
+
+        return {
+            "session_id": str(screening_session_id),
+            "condition": worst_condition_name,
+            "search_query": search_query,
+            "num_retrieved": len(retrieved_chunks),
+            "retrieved_chunks": retrieved_chunks,
+            "final_report": final_report
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"RAG trace failed: {e}")
+        raise HTTPException(status_code=500, detail=f"RAG trace failed: {str(e)}")
