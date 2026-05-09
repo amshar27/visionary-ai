@@ -542,10 +542,19 @@ def override_ai_result(ai_result_id: str, body: AIResultOverride):
     Allows a doctor to manually override the AI result for a single eye.
     Nulls out confidence, referable, follow_up, llm_summary, and warnings.
     Only updates disease_detected, disease_type, and severity_label.
+    Also invalidates the session-wide RAG summary because any single-eye edit
+    makes the existing report (which covers both eyes) stale.
     """
-    existing = supabase.table("ai_results").select("id").eq("id", ai_result_id).execute()
+    existing = (
+        supabase.table("ai_results")
+        .select("id, screening_session_id")
+        .eq("id", ai_result_id)
+        .execute()
+    )
     if not existing.data:
         raise HTTPException(status_code=404, detail="AI result not found")
+
+    session_id = existing.data[0].get("screening_session_id")
 
     update_data = {
         "disease_detected": body.disease_detected,
@@ -560,7 +569,22 @@ def override_ai_result(ai_result_id: str, body: AIResultOverride):
     }
 
     supabase.table("ai_results").update(update_data).eq("id", ai_result_id).execute()
-    return {"ok": True, "message": "AI result updated"}
+
+    # Invalidate the session-wide RAG summary and any saved RAGAS scores —
+    # the report describes both eyes, so any single-eye edit makes it stale.
+    try:
+        supabase.table("ai_results").update(
+            {"rag_summary": None, "ragas_scores": None}
+        ).eq("screening_session_id", session_id).execute()
+        logger.info("Invalidated rag_summary for session %s after doctor edit", session_id)
+    except Exception as inv_err:
+        logger.warning("Failed to invalidate rag_summary for session %s: %s", session_id, inv_err)
+
+    return {
+        "ok": True,
+        "message": "AI result updated. Clinical summary invalidated — please regenerate.",
+        "rag_invalidated": True,
+    }
 
 
 @router.get("/health")
@@ -801,6 +825,9 @@ def generate_rag_summary(screening_session_id: UUID):
         diagnostic_lines = []
         for result in ai_res.data:
             eye = (result.get('eye') or '').capitalize()
+            # Doctor-edited eyes have dr_severity nulled out by PATCH /ai/result/{id}
+            # but retain a non-null severity_label set by the doctor.
+            is_edited = result.get('dr_severity') is None and result.get('severity_label') is not None
             severity = result.get('dr_severity') or result.get('severity_label') or 'none'
             confidence = result.get('confidence_score') or 0.0
 
@@ -809,11 +836,17 @@ def generate_rag_summary(screening_session_id: UUID):
                 worst_severity_score = current_score
                 worst_condition_name = severity
 
-            severity_lower = severity.lower()
-            label = severity.capitalize() if severity_lower in ['cataract', 'glaucoma'] else f"{severity.capitalize()} DR"
-            diagnostic_lines.append(
-                f"- **{eye} Eye**: Prediction: {label} | Confidence: {confidence:.1%}"
-            )
+            if is_edited:
+                disease_type = result.get('disease_type') or 'Unknown'
+                diagnostic_lines.append(
+                    f"- **{eye} Eye**: {disease_type} — {severity.capitalize()} *(doctor-confirmed)*"
+                )
+            else:
+                severity_lower = severity.lower()
+                label = severity.capitalize() if severity_lower in ['cataract', 'glaucoma'] else f"{severity.capitalize()} DR"
+                diagnostic_lines.append(
+                    f"- **{eye} Eye**: Prediction: {label} | Confidence: {confidence:.1%}"
+                )
         
         diagnostic_data_str = "\n".join(diagnostic_lines)
 
@@ -887,10 +920,15 @@ Guideline text:
         **Clinical Guidelines (Retrieved via RAG):**
         {extracted_guidelines}
 
+        **Important — Doctor-Confirmed Diagnoses:**
+        For eyes marked *(doctor-confirmed)* in the diagnostic data above, do NOT mention any
+        confidence percentage — that diagnosis was set by the doctor, not the AI. Refer to it
+        as the doctor's confirmed diagnosis rather than an AI prediction.
+
         **Task:**
         Generate a report with exactly these headings:
         1. **Title**: Write exactly "### Clinical Summary for {doctor_name}"
-        2. **Diagnostic Summary**: State the AI finding for each eye clearly. Compare with previous screening history and note if condition is new, stable, or worsened.
+        2. **Diagnostic Summary**: State the finding for each eye clearly. For AI-predicted eyes, state the AI finding with its confidence; for doctor-confirmed eyes, state the doctor's diagnosis without any confidence figure. Compare with previous screening history and note if condition is new, stable, or worsened.
         3. **Patient Risk Profile**: Summarize diabetes history, comorbidities, family history of glaucoma, IOP history, previous eye surgery, and visual symptoms. Highlight any risk factors relevant to {worst_condition_name}.
         4. **Key Clinical Features**: Describe typical retinal signs for {worst_condition_name}.
         5. **Recommended Management**: Based on the retrieved guidelines, provide a specific referral timeline, management steps, and follow-up schedule tailored to this patient's risk profile.
