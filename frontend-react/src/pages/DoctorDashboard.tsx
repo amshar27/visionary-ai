@@ -459,7 +459,12 @@ function ReviewView({
         setRightConfirmed({ disease_type: form.disease_type, severity: form.severity });
       }
 
+      // Backend invalidates the session-wide rag_summary on edit; clear the
+      // local copy so the doctor regenerates before submitting/sending.
+      setRagResult(null);
+
       toast.success(`${eye.charAt(0).toUpperCase() + eye.slice(1)} eye result updated`);
+      toast('Clinical summary cleared — click Regenerate to update it', { icon: 'ℹ️' });
     } catch {
       toast.error(`Failed to update ${eye} eye result`);
     }
@@ -896,6 +901,33 @@ function ReviewView({
             <ReactMarkdown>{ragResult.rag_summary}</ReactMarkdown>
           </div>
 
+        </div>
+      )}
+
+      {/* 3b. Placeholder — shown when a doctor edit has invalidated the saved summary */}
+      {!ragResult && !ragLoading && (leftEdited || rightEdited) && (
+        <div
+          className="bg-white rounded-xl border-l-4 mb-6"
+          style={{ borderLeftColor: '#f59e0b', padding: '24px 28px', boxShadow: '0 10px 30px rgba(0,0,0,0.08)' }}
+        >
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-xl">⚠️</span>
+            <h4 className="text-base font-semibold text-gray-800">AI Clinical Summary</h4>
+            <span className="ml-auto text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#b45309' }}>
+              Needs Regeneration
+            </span>
+          </div>
+          <p className="text-sm text-gray-600 mb-4">
+            Clinical summary needs regeneration after the diagnosis edit.
+          </p>
+          <button
+            onClick={handleRAG}
+            disabled={ragLoading || isLocked || !hasResults}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+            style={{ background: '#7c3aed', boxShadow: '0 6px 20px rgba(124,58,237,0.35)' }}
+          >
+            🧠 {ragLoading ? 'Regenerating…' : 'Regenerate Clinical Summary'}
+          </button>
         </div>
       )}
 
