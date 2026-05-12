@@ -217,6 +217,9 @@ export const aiAPI = {
   getRagSummary: (sessionId: string) =>
     api.get<{ rag_summary: string | null }>(`/ai/rag-summary/${sessionId}`).then((r) => r.data),
 
+  updateRagSummary: (sessionId: string, ragSummary: string) =>
+    api.patch(`/ai/rag-summary/${sessionId}`, { rag_summary: ragSummary }),
+
   overrideAiResult: async (
     aiResultId: string,
     data: {

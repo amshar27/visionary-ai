@@ -642,6 +642,16 @@ def get_rag_summary(session_id: UUID):
         return {"rag_summary": None}
 
 
+@router.patch("/rag-summary/{session_id}")
+async def update_rag_summary(session_id: str, payload: dict):
+    rag_summary = payload.get("rag_summary", "")
+    supabase.table("ai_results") \
+        .update({"rag_summary": rag_summary}) \
+        .eq("screening_session_id", session_id) \
+        .execute()
+    return {"ok": True, "message": "RAG summary updated"}
+
+
 @router.post("/ingest-research")
 def ingest_research_papers(bucket_name: str = "guidelines"):
     """

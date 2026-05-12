@@ -153,9 +153,10 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `POST /ai/analyze?screening_session_id=` — runs model on both eyes, generates Grad-CAM, uploads heatmaps to `retinal-scans/heatmaps/`, then upserts per-eye rows (with `heatmap_url`) into `ai_results` and sets session status=analysed. Requires both left and right images. Blocked if session status is in `LOCKED_STATUSES = {assigned, approved, overridden}`. The upsert dict includes: `screening_session_id, eye, disease_detected, dr_severity, referable, confidence_score, macular_involvement, llm_summary, follow_up_interval, warnings, class_probabilities, heatmap_url`. **Not** included: `predicted_class`, `disease_type`, `severity_label` — these are only ever set via doctor override (PATCH).
 - `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use. Not currently called by the frontend.
 - `GET /ai/results/by-session/{id}` — returns ai_results rows for session
-- `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and sets `warnings` to `[]`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately). After this PATCH, `disease_type` and `severity_label` are the only fields carrying the doctor's diagnosis.
-- `POST /ai/summarise-rag?screening_session_id=` — generates full RAG clinical report via a 2-step LLM pipeline: (1) gpt-4o-mini extracts/condenses guidelines from retrieved docs, (2) gpt-4o writes the final structured report. Fetches patient history, doctor name, past session history, current AI results, then queries `match_documents` RPC (threshold=0.45, count=5). Search query is conditional: `"…for {condition} Malaysia"` for cataract/glaucoma, `"…for {condition} diabetic retinopathy Malaysia"` otherwise. Persists the report to `ai_results.rag_summary`. Defensively reads severity as `dr_severity or severity_label or 'none'` to handle doctor-overridden rows where `dr_severity` is null. **On any exception, returns `{rag_summary: "**Error generating report:** ...", references: []}` with HTTP 200 (does not raise)** — the frontend should check the body for an error prefix.
+- `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and sets `warnings` to `[]`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately). After this PATCH, `disease_type` and `severity_label` are the only fields carrying the doctor's diagnosis. Also invalidates the session-wide RAG by setting `rag_summary` and `ragas_scores` to `null` on **all** `ai_results` rows for the session (not just the edited eye), because the report describes both eyes.
+- `POST /ai/summarise-rag?screening_session_id=` — generates full RAG clinical report via a 2-step LLM pipeline: (1) gpt-4o-mini extracts/condenses guidelines from retrieved docs, (2) gpt-4o writes the final structured report. Fetches patient history, doctor name, past session history, current AI results, then queries `match_documents` RPC (threshold=0.45, count=5). Search query is conditional: `"…for {condition} Malaysia"` for cataract/glaucoma, `"…for {condition} diabetic retinopathy Malaysia"` otherwise. Persists the report to `ai_results.rag_summary`. Defensively reads severity as `dr_severity or severity_label or 'none'` to handle doctor-overridden rows where `dr_severity` is null. Doctor-edited eyes are detected by `dr_severity is None and severity_label is not None` and formatted as `"- **{Eye} Eye**: {disease_type} — {severity} *(doctor-confirmed)*"` (no confidence score); AI-predicted eyes format as `"- **{Eye} Eye**: Prediction: {label} | Confidence: {x.x%}"`. **On any exception, returns `{rag_summary: "**Error generating report:** ...", references: []}` with HTTP 200 (does not raise)** — the frontend should check the body for an error prefix.
 - `GET /ai/rag-summary/{id}` — returns persisted rag_summary field from the first ai_results row for the session
+- `PATCH /ai/rag-summary/{session_id}` — updates `rag_summary` on **all** `ai_results` rows for the session with the provided string. Accepts `{rag_summary: string}`. Used by the doctor report inline editor to persist manual edits. Returns `{ok: true, message: "RAG summary updated"}`.
 - `POST /ai/evaluate-rag/{screening_session_id}` — evaluates an existing RAG summary using RAGAS metrics (faithfulness, answer_relevancy, and context_relevancy/context_utilization/ContextRelevance — selected via try/except at import time depending on the installed RAGAS version, see `_context_metric_name` log line). Re-runs retrieval to build the evaluation dataset. Best-effort persists scores to `ai_results.ragas_scores`. Returns `{ok, session_id, condition, scores}`. Reads severity defensively. **Not currently called by the frontend** — used via direct HTTP for FYP evaluation.
 - `GET /ai/rag-trace/{screening_session_id}` — read-only debug endpoint (no LLM calls, no DB writes) that re-runs only the RAG retrieval step. Returns `{session_id, condition, search_query, num_retrieved, retrieved_chunks: [{source, similarity, content_preview}], final_report}`. Used for FYP evaluation. ⚠️ Reads `result['dr_severity']` directly without the defensive `or severity_label` fallback (will raise `AttributeError: 'NoneType' object has no attribute 'lower'` on doctor-overridden rows). Not called by the frontend.
 - `GET /ai/health` — model load status + device + classes
@@ -247,7 +248,7 @@ Unique constraint: `(screening_session_id, eye_side)` — enables UPSERT re-uplo
 Unique constraint: `(screening_session_id, eye)` — enables UPSERT re-analysis.
 Note: `predicted_class`, `disease_type`, and `severity_label` exist in the DB schema but are **not currently written** by `/ai/analyze` (the upsert dict omits them). `predicted_class` will always be `null`. `disease_type` and `severity_label` are only ever populated via doctor override (`PATCH /ai/result/{id}`).
 Note: `heatmap_url` is populated by `/ai/analyze` from the public URL of the uploaded Grad-CAM JPEG (`retinal-scans/heatmaps/heatmap_{session_id}_{eye}.jpg`). It is `null` only when heatmap generation/upload fails.
-Note: After a doctor inline override (`PATCH /ai/result/{id}`), `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary` are set to null and `warnings` to `[]`. Only `disease_detected`, `disease_type`, and `severity_label` carry the doctor's values. Always read severity as `dr_severity or severity_label or 'none'` defensively.
+Note: After a doctor inline override (`PATCH /ai/result/{id}`), `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary` are set to null and `warnings` to `[]`. Only `disease_detected`, `disease_type`, and `severity_label` carry the doctor's values. Additionally, `rag_summary` and `ragas_scores` are nulled on **all rows for the session** (session-wide invalidation). Always read severity as `dr_severity or severity_label or 'none'` defensively.
 
 ### `doctor_reviews`
 `id, screening_session_id (FK), doctor_id (FK), decision (approved|overridden), final_grade_left, final_grade_right, override_reason, report_url, reviewed_at`
@@ -304,19 +305,26 @@ Routes are in `App.tsx`. `ProtectedRoute` redirects unauthenticated users to `/l
 4. **session** — upload L/R images, trigger AI, assign to doctor, delete pending session
 5. **appointments** — calendar view (month/week/day toggle) of appointments scheduled by this nurse, plus booking flow
 
-Sidebar patient list shows patient name only (IC line removed).
+Sidebar patient list shows patient name only (IC line removed). Required fields (Full Name, IC/Passport Number, Sex) show a red asterisk via `<span className="text-red-500">*</span>` in their labels.
 
 ### DoctorDashboard — 3 sub-views (`DoctorView` discriminated union)
-1. **inbox** — list sessions assigned to the logged-in doctor
+1. **inbox** — list sessions assigned to the logged-in doctor. Status filter options: `all | assigned | approved | overridden` ('pending' excluded — doctors only see sessions that have been assigned to them). Table column header is "Session No." (not "No.").
 2. **review** — AI Verdict section with original/heatmap toggle (EyePanel), per-eye edit widgets, RAG report, and Approve or Submit button. Raw retinal images are **not** shown as a separate section — they are accessible only via the heatmap toggle within AI Verdict. The old Override modal has been removed.
 3. **appointments** — calendar view of appointments assigned to this doctor
 
 **Per-eye inline edit flow** (replaces the old Override button):
 - Each eye widget has an **Edit** button (visible when session is not locked).
 - Clicking Edit switches the widget into a 3-field form: Disease Detected, Disease Type, Severity. Severity options are driven by `getSeverityOptions(diseaseType, diseaseDetected)`.
-- Clicking **Confirm** opens a custom `showOverrideConfirm` modal. On confirmation, calls `PATCH /ai/result/{id}`, updates local `aiResults` state, and collapses the widget to a post-edit summary with a "Doctor Edited" amber badge.
+- Clicking **Confirm** opens a custom `showOverrideConfirm` modal. On confirmation, calls `PATCH /ai/result/{id}`, updates local `aiResults` state, and collapses the widget to a post-edit summary with a "Doctor Edited" amber badge. Also clears `ragResult` locally (set to `null`) and shows a toast "Clinical summary cleared — click Regenerate to update it". The RAG section then shows a yellow "Needs Regeneration" card with a "Regenerate Clinical Summary" button instead of the previous report.
 - When at least one eye has been edited, the **Approve** button is replaced by a **Submit** button. Submit calls `POST /screenings/{id}/doctor-review` with `decision=overridden` and a fixed override reason.
 - All edit state (`leftEditing`, `rightEditing`, `leftEdited`, `rightEdited`, `leftEditForm`, `rightEditForm`, `leftConfirmed`, `rightConfirmed`, `showOverrideConfirm`, `pendingConfirmEye`) resets when the doctor navigates to a different session.
+
+**RAG report inline edit flow**:
+- The AI Clinical Summary header shows an **Edit** button (red/orange gradient, same style as widget Edit buttons) when `ragResult` exists, the session is not locked, and `isEditingReport === false`.
+- Clicking Edit enters edit mode: the report is split into segments via `segmentMarkdown(rag_summary)`. Non-editable segments (headings starting with `#`, `---` rules, lines whose trimmed form starts with `**`, blank lines) each become their own read-only `ReactMarkdown` block. Consecutive editable lines are grouped into a single `<textarea>` that auto-sizes to its content.
+- Clicking **Cancel** exits edit mode without saving; the Edit button reappears.
+- Clicking **Confirm** opens a `showSaveReportConfirm` modal. On confirmation, reassembles segments via `.map(s => s.text).join('\n')`, calls `PATCH /ai/rag-summary/{session_id}`, and updates local `ragResult`.
+- Edit state (`isEditingReport`, `editedSegments`, `showSaveReportConfirm`) resets when the doctor navigates to a different session.
 
 Sidebar session list shows patient name + session number only (Status line removed). Refresh button next to ← Back to Inbox has been removed.
 
@@ -372,24 +380,26 @@ After `PATCH /ai/result/{id}`, the `dr_severity` column is set to `null`. Any ba
 ```python
 severity = result.get('dr_severity') or result.get('severity_label') or 'none'
 ```
-This applies in `generate_rag_summary` and `evaluate_rag` in `ai.py` (already fixed). **`rag_trace` (`GET /ai/rag-trace/{id}`) is NOT yet fixed** — it reads `result['dr_severity']` directly (`ai.py:1072`) and will crash on overridden rows. Apply the defensive pattern to any future code that reads `dr_severity` from `ai_results` rows.
+This applies in `generate_rag_summary` and `evaluate_rag` in `ai.py` (already fixed). **`rag_trace` (`GET /ai/rag-trace/{id}`) is NOT yet fixed** — it reads `result['dr_severity']` directly (`ai.py:1120`) and will crash on overridden rows. Apply the defensive pattern to any future code that reads `dr_severity` from `ai_results` rows.
 
 ### Glaucoma/IOP column names — RAG reads wrong columns
 The `patients` table (and `PatientCreate` Pydantic model, `Patient` TypeScript interface, and Nurse form) uses these column names:
 - `glaucoma_family_history`
 - `elevated_iop_history`
 
-But `generate_rag_summary` in `ai.py:731,751,752` reads them as:
+But `generate_rag_summary` in `ai.py:765,785,786` reads them as:
 - `family_history_glaucoma`
 - `elevated_iop`
 
-This means the RAG report **always shows "Unknown"** for these two fields, regardless of what the nurse entered. To fix, change the SELECT in `ai.py:731` to `glaucoma_family_history, elevated_iop_history` and update the corresponding `pt.get(...)` calls. (`previous_eye_surgery` and `visual_symptoms` are correctly named on both sides.)
+This means the RAG report **always shows "Unknown"** for these two fields, regardless of what the nurse entered. To fix, change the SELECT in `ai.py:765` to `glaucoma_family_history, elevated_iop_history` and update the corresponding `pt.get(...)` calls. (`previous_eye_surgery` and `visual_symptoms` are correctly named on both sides.)
 
 ### `RetinalImage.created_at` vs `uploaded_at`
 The `retinal_images` table column is `uploaded_at` (set in `uploads.py:82`). The TypeScript `RetinalImage` interface declares `created_at: string` instead. Read defensively if you need the timestamp from this row.
 
 ### Frontend coverage gaps
-- `aiAPI` does **not** expose `/ai/evaluate-rag`, `/ai/rag-trace`, or `/ai/reanalyze` — these are backend-only / FYP-evaluation endpoints called via direct HTTP (e.g. curl or test scripts), not from the React app.
+- `aiAPI` does **not** expose `/ai/evaluate-rag` or `/ai/rag-trace` — these are backend-only / FYP-evaluation endpoints called via direct HTTP (e.g. curl or test scripts), not from the React app.
+- `aiAPI` **does** expose `reanalyze(sessionId)` — calls `POST /ai/reanalyze/{id}`. It exists in `api.ts` but is not triggered from the nurse/doctor UI (admin/debug only).
+- `aiAPI` exposes `updateRagSummary(sessionId, ragSummary)` — calls `PATCH /ai/rag-summary/{id}`, used by the doctor report inline editor.
 
 ---
 
@@ -415,6 +425,7 @@ Exceptions to the wrapper pattern:
 - **Appointments** endpoints return the appointment object directly (`AppointmentOut` model). `POST /appointments` returns HTTP 201.
 - **`POST /ai/summarise-rag`** returns `{rag_summary, references}` (no `ok`). On internal exceptions, returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:** "`.
 - **`GET /ai/rag-summary/{id}`** returns `{rag_summary: string | null}` (no `ok`).
+- **`PATCH /ai/rag-summary/{id}`** returns `{ok: true, message: "RAG summary updated"}`.
 - **`POST /screenings/{id}/send-report`** returns `{success: true}`.
 - **`POST /ai/evaluate-rag/{id}`** returns `{ok, session_id, condition, scores}`.
 - **`GET /ai/rag-trace/{id}`** returns `{session_id, condition, search_query, num_retrieved, retrieved_chunks, final_report}` (no `ok`).

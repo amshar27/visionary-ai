@@ -262,11 +262,11 @@ function NewPatientView({
           {sectionTitle('Basic Details')}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs mb-1 block text-gray-500">Full Name *</label>
+              <label className="text-xs mb-1 block text-gray-500">Full Name <span className="text-red-500">*</span></label>
               <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={name} onChange={e => setName(e.target.value)} />
             </div>
             <div>
-              <label className="text-xs mb-1 block text-gray-500">IC / Passport Number *</label>
+              <label className="text-xs mb-1 block text-gray-500">IC / Passport Number <span className="text-red-500">*</span></label>
               <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={ic} onChange={e => setIc(e.target.value)} />
             </div>
             <div>
@@ -274,7 +274,7 @@ function NewPatientView({
               <input type="number" min={0} max={120} className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={age === 0 ? '' : age} onChange={e => setAge(isNaN(e.target.valueAsNumber) ? 0 : e.target.valueAsNumber)} />
             </div>
             <div>
-              <label className="text-xs mb-1 block text-gray-500">Sex *</label>
+              <label className="text-xs mb-1 block text-gray-500">Sex <span className="text-red-500">*</span></label>
               <select className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={sex} onChange={e => setSex(e.target.value as 'Male' | 'Female')}>
                 <option value="Male">Male</option>
                 <option value="Female">Female</option>

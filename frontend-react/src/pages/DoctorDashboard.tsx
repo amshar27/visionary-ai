@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { RefreshCw, LogOut, Search, Menu, ChevronLeft, CalendarDays, X, ChevronRight, Mail } from 'lucide-react';
+import { RefreshCw, LogOut, Search, Menu, ChevronLeft, CalendarDays, X, ChevronRight, Mail, Pencil } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ReactMarkdown from 'react-markdown';
 import { useAuth } from '../context/AuthContext';
@@ -175,7 +175,7 @@ function InboxView({
       {/* Filter */}
       <div className="flex items-center gap-2 mb-4">
         <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Status:</span>
-        {['all', 'assigned', 'pending', 'approved', 'overridden'].map(opt => (
+        {['all', 'assigned', 'approved', 'overridden'].map(opt => (
           <button
             key={opt}
             onClick={() => setStatusFilter(opt)}
@@ -201,8 +201,8 @@ function InboxView({
         <>
           <p className="text-xs mb-3 text-gray-400">Showing {filtered.length} session(s).</p>
           {/* Table header */}
-          <div className="grid text-xs font-bold uppercase tracking-wide pb-2 mb-1 text-gray-400" style={{ gridTemplateColumns: '60px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #e5e7eb' }}>
-            <span>No.</span><span>Date</span><span>Patient</span><span>Assigned By</span><span>Status</span><span>Action</span>
+          <div className="grid text-xs font-bold uppercase tracking-wide pb-2 mb-1 text-gray-400" style={{ gridTemplateColumns: '90px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #e5e7eb' }}>
+            <span>Session No.</span><span>Date</span><span>Patient</span><span>Assigned By</span><span>Status</span><span>Action</span>
           </div>
           {filtered.map(s => {
             const raw = s as unknown as Record<string, unknown>;
@@ -212,7 +212,7 @@ function InboxView({
             const assignedBy = raw.assigned_by_name as string ?? '-';
             const isFinalized = ['approved', 'overridden'].includes(s.status?.toLowerCase());
             return (
-              <div key={s.id} className="grid items-center py-3" style={{ gridTemplateColumns: '60px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #f3f4f6' }}>
+              <div key={s.id} className="grid items-center py-3" style={{ gridTemplateColumns: '90px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #f3f4f6' }}>
                 <span className="text-sm text-gray-900">{String(sessionNo)}</span>
                 <span className="text-sm text-gray-600">{formatDt(sessionDate)}</span>
                 <span className="text-sm text-gray-900 font-medium">{patientName}</span>
@@ -258,6 +258,58 @@ function getSeverityOptions(diseaseType: string, diseaseDetected: string): strin
   }
 }
 
+// ─── RAG report segmentation (line-by-line edit support) ─────────────────────
+
+type Segment = {
+  id: number;
+  editable: boolean;
+  text: string;
+};
+
+function segmentMarkdown(markdown: string): Segment[] {
+  const lines = markdown.split('\n');
+  const segments: Segment[] = [];
+  let currentEditable: boolean | null = null;
+  let currentLines: string[] = [];
+  let nextId = 0;
+
+  const isNonEditable = (line: string): boolean => {
+    if (line.startsWith('#')) return true;
+    if (line === '---') return true;
+    const trimmed = line.trim();
+    if (trimmed === '') return true;
+    if (trimmed.startsWith('**')) return true;
+    return false;
+  };
+
+  const flush = () => {
+    if (currentLines.length === 0 || currentEditable === null) return;
+    if (currentEditable && currentLines.join('').trim() === '') {
+      currentLines = [];
+      return;
+    }
+    segments.push({ id: nextId++, editable: currentEditable, text: currentLines.join('\n') });
+    currentLines = [];
+  };
+
+  for (const line of lines) {
+    const lineEditable = !isNonEditable(line);
+    if (!lineEditable) {
+      // Each non-editable line is its own segment
+      flush();
+      currentEditable = null;
+      segments.push({ id: nextId++, editable: false, text: line });
+    } else if (currentEditable === null) {
+      currentEditable = true;
+      currentLines.push(line);
+    } else {
+      currentLines.push(line);
+    }
+  }
+  flush();
+  return segments;
+}
+
 // ─── Sub-view: Doctor Review ──────────────────────────────────────────────────
 
 function ReviewView({
@@ -280,6 +332,9 @@ function ReviewView({
   const [showHeatmap, setShowHeatmap] = useState(true); // default true for doctor (matches Streamlit)
   const [ragResult, setRagResult] = useState<RAGSummaryResponse | null>(null);
   const [ragLoading, setRagLoading] = useState(false);
+  const [isEditingReport, setIsEditingReport] = useState(false);
+  const [editedSegments, setEditedSegments] = useState<Segment[]>([]);
+  const [showSaveReportConfirm, setShowSaveReportConfirm] = useState(false);
 
   // Send report state
   const [showSendConfirm, setShowSendConfirm] = useState(false);
@@ -357,6 +412,9 @@ function ReviewView({
     setRightConfirmed(null);
     setShowOverrideConfirm(false);
     setPendingConfirmEye(null);
+    setIsEditingReport(false);
+    setEditedSegments([]);
+    setShowSaveReportConfirm(false);
   }, [sessionId, refreshKey]);
 
   const status = (session?.status ?? '').toLowerCase();
@@ -512,6 +570,19 @@ function ReviewView({
       toast.error(err instanceof Error ? err.message : 'Failed to generate summary.');
     } finally {
       setRagLoading(false);
+    }
+  };
+
+  const handleSaveReportEdits = async () => {
+    try {
+      const reassembled = editedSegments.map(s => s.text).join('\n');
+      await aiAPI.updateRagSummary(sessionId, reassembled);
+      setRagResult({ rag_summary: reassembled, references: ragResult?.references ?? [] });
+      setIsEditingReport(false);
+      setShowSaveReportConfirm(false);
+      toast.success('Clinical summary saved.');
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to save report.');
     }
   };
 
@@ -892,14 +963,74 @@ function ReviewView({
             <span className="ml-auto text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: '#dbeafe', color: '#1d4ed8' }}>
               Based on Research
             </span>
+            {ragResult && !isLocked && !isEditingReport && (
+              <button
+                onClick={() => {
+                  setIsEditingReport(true);
+                  setEditedSegments(segmentMarkdown(ragResult.rag_summary));
+                }}
+                className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110"
+                style={{
+                  background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
+                  boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
+                }}
+              >
+                Edit
+              </button>
+            )}
           </div>
 
           <hr style={{ borderColor: '#e5e7eb', marginBottom: 20 }} />
 
-          {/* Markdown body */}
-          <div className="prose prose-sm md:prose-base prose-blue max-w-none prose-headings:font-semibold prose-headings:text-gray-800 prose-p:text-gray-600 prose-hr:border-gray-200 prose-hr:my-6 prose-strong:text-gray-800 prose-li:text-gray-600">
-            <ReactMarkdown>{ragResult.rag_summary}</ReactMarkdown>
-          </div>
+          {/* Markdown body or editable textarea */}
+          {isEditingReport ? (
+            <>
+              <div className="space-y-1">
+                {editedSegments.map((seg) =>
+                  seg.editable ? (
+                    <textarea
+                      key={seg.id}
+                      value={seg.text}
+                      onChange={(e) => {
+                        setEditedSegments(prev =>
+                          prev.map(s => s.id === seg.id ? { ...s, text: e.target.value } : s)
+                        );
+                      }}
+                      className="w-full p-2 border border-blue-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none overflow-hidden overflow-y-hidden"
+                      rows={Math.max(3, seg.text.split('\n').length + 1)}
+                    />
+                  ) : (
+                    <div
+                      key={seg.id}
+                      className="prose prose-sm md:prose-base prose-blue max-w-none prose-headings:font-semibold prose-headings:text-gray-800 prose-p:text-gray-600 prose-hr:border-gray-200 prose-hr:my-6 prose-strong:text-gray-800 prose-li:text-gray-600"
+                    >
+                      <ReactMarkdown>{seg.text}</ReactMarkdown>
+                    </div>
+                  )
+                )}
+              </div>
+              <div className="flex justify-end gap-3 mt-4">
+                <button
+                  onClick={() => setIsEditingReport(false)}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
+                  style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => setShowSaveReportConfirm(true)}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
+                  style={{ background: '#2563eb' }}
+                >
+                  Confirm
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="prose prose-sm md:prose-base prose-blue max-w-none prose-headings:font-semibold prose-headings:text-gray-800 prose-p:text-gray-600 prose-hr:border-gray-200 prose-hr:my-6 prose-strong:text-gray-800 prose-li:text-gray-600">
+              <ReactMarkdown>{ragResult.rag_summary}</ReactMarkdown>
+            </div>
+          )}
 
         </div>
       )}
@@ -1036,6 +1167,37 @@ function ReviewView({
                 style={{ background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' }}
               >
                 Confirm Override
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Save Report Edits Confirmation Modal */}
+      {showSaveReportConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
+          <div className="w-full max-w-sm mx-4 p-6 rounded-2xl bg-white" style={{ boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}>
+            <div className="flex items-center gap-3 mb-3">
+              <Pencil size={18} className="text-blue-600" />
+              <h3 className="text-lg font-bold text-gray-900">Save Report Edits?</h3>
+            </div>
+            <p className="text-sm text-gray-600 mb-5">
+              Your changes will update the clinical summary and save it to the database.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowSaveReportConfirm(false)}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
+                style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveReportEdits}
+                className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
+                style={{ background: '#2563eb' }}
+              >
+                Save
               </button>
             </div>
           </div>

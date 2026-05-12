@@ -71,7 +71,7 @@ export default function Login() {
         <form onSubmit={handleSubmit} className="space-y-4">
           <input
             type="email"
-            placeholder="e.g. nurse@hospital.my"
+            placeholder="e.g. name@gmail.com"
             value={email}
             onChange={e => setEmail(e.target.value)}
             className="w-full px-4 py-3 rounded-xl text-sm outline-none"
