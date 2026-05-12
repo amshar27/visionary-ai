@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw, LogOut, Search, Menu, ChevronLeft, CalendarDays, X, ChevronRight, Mail, Pencil } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -8,6 +8,7 @@ import { screeningsAPI, uploadsAPI, aiAPI, appointmentsAPI } from '../services/a
 import { formatDt, getEyeSide, fmtConfidence } from '../utils/format';
 import type { ScreeningSession, RetinalImage, AIResult, DoctorReview, RAGSummaryResponse, Appointment } from '../types';
 import type { User } from '../types';
+import RagReportEditor, { type RagReportEditorHandle } from '../components/RagReportEditor';
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
 
@@ -258,58 +259,6 @@ function getSeverityOptions(diseaseType: string, diseaseDetected: string): strin
   }
 }
 
-// ─── RAG report segmentation (line-by-line edit support) ─────────────────────
-
-type Segment = {
-  id: number;
-  editable: boolean;
-  text: string;
-};
-
-function segmentMarkdown(markdown: string): Segment[] {
-  const lines = markdown.split('\n');
-  const segments: Segment[] = [];
-  let currentEditable: boolean | null = null;
-  let currentLines: string[] = [];
-  let nextId = 0;
-
-  const isNonEditable = (line: string): boolean => {
-    if (line.startsWith('#')) return true;
-    if (line === '---') return true;
-    const trimmed = line.trim();
-    if (trimmed === '') return true;
-    if (trimmed.startsWith('**')) return true;
-    return false;
-  };
-
-  const flush = () => {
-    if (currentLines.length === 0 || currentEditable === null) return;
-    if (currentEditable && currentLines.join('').trim() === '') {
-      currentLines = [];
-      return;
-    }
-    segments.push({ id: nextId++, editable: currentEditable, text: currentLines.join('\n') });
-    currentLines = [];
-  };
-
-  for (const line of lines) {
-    const lineEditable = !isNonEditable(line);
-    if (!lineEditable) {
-      // Each non-editable line is its own segment
-      flush();
-      currentEditable = null;
-      segments.push({ id: nextId++, editable: false, text: line });
-    } else if (currentEditable === null) {
-      currentEditable = true;
-      currentLines.push(line);
-    } else {
-      currentLines.push(line);
-    }
-  }
-  flush();
-  return segments;
-}
-
 // ─── Sub-view: Doctor Review ──────────────────────────────────────────────────
 
 function ReviewView({
@@ -333,8 +282,8 @@ function ReviewView({
   const [ragResult, setRagResult] = useState<RAGSummaryResponse | null>(null);
   const [ragLoading, setRagLoading] = useState(false);
   const [isEditingReport, setIsEditingReport] = useState(false);
-  const [editedSegments, setEditedSegments] = useState<Segment[]>([]);
   const [showSaveReportConfirm, setShowSaveReportConfirm] = useState(false);
+  const reportEditorRef = useRef<RagReportEditorHandle>(null);
 
   // Send report state
   const [showSendConfirm, setShowSendConfirm] = useState(false);
@@ -413,7 +362,6 @@ function ReviewView({
     setShowOverrideConfirm(false);
     setPendingConfirmEye(null);
     setIsEditingReport(false);
-    setEditedSegments([]);
     setShowSaveReportConfirm(false);
   }, [sessionId, refreshKey]);
 
@@ -575,9 +523,9 @@ function ReviewView({
 
   const handleSaveReportEdits = async () => {
     try {
-      const reassembled = editedSegments.map(s => s.text).join('\n');
-      await aiAPI.updateRagSummary(sessionId, reassembled);
-      setRagResult({ rag_summary: reassembled, references: ragResult?.references ?? [] });
+      const markdown = reportEditorRef.current?.getMarkdown() ?? '';
+      await aiAPI.updateRagSummary(sessionId, markdown);
+      setRagResult({ rag_summary: markdown, references: ragResult?.references ?? [] });
       setIsEditingReport(false);
       setShowSaveReportConfirm(false);
       toast.success('Clinical summary saved.');
@@ -965,10 +913,7 @@ function ReviewView({
             </span>
             {ragResult && !isLocked && !isEditingReport && (
               <button
-                onClick={() => {
-                  setIsEditingReport(true);
-                  setEditedSegments(segmentMarkdown(ragResult.rag_summary));
-                }}
+                onClick={() => setIsEditingReport(true)}
                 className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110"
                 style={{
                   background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
@@ -978,37 +923,26 @@ function ReviewView({
                 Edit
               </button>
             )}
+            {isEditingReport && (
+              <span
+                className="text-xs font-medium px-2 py-0.5 rounded-full"
+                style={{ background: '#fef3c7', color: '#b45309' }}
+              >
+                Editing
+              </span>
+            )}
           </div>
 
           <hr style={{ borderColor: '#e5e7eb', marginBottom: 20 }} />
 
-          {/* Markdown body or editable textarea */}
+          {/* WYSIWYG editor (TipTap) or read-only markdown view */}
           {isEditingReport ? (
             <>
-              <div className="space-y-1">
-                {editedSegments.map((seg) =>
-                  seg.editable ? (
-                    <textarea
-                      key={seg.id}
-                      value={seg.text}
-                      onChange={(e) => {
-                        setEditedSegments(prev =>
-                          prev.map(s => s.id === seg.id ? { ...s, text: e.target.value } : s)
-                        );
-                      }}
-                      className="w-full p-2 border border-blue-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none overflow-hidden overflow-y-hidden"
-                      rows={Math.max(3, seg.text.split('\n').length + 1)}
-                    />
-                  ) : (
-                    <div
-                      key={seg.id}
-                      className="prose prose-sm md:prose-base prose-blue max-w-none prose-headings:font-semibold prose-headings:text-gray-800 prose-p:text-gray-600 prose-hr:border-gray-200 prose-hr:my-6 prose-strong:text-gray-800 prose-li:text-gray-600"
-                    >
-                      <ReactMarkdown>{seg.text}</ReactMarkdown>
-                    </div>
-                  )
-                )}
-              </div>
+              <RagReportEditor
+                key={sessionId}
+                ref={reportEditorRef}
+                initialMarkdown={ragResult.rag_summary}
+              />
               <div className="flex justify-end gap-3 mt-4">
                 <button
                   onClick={() => setIsEditingReport(false)}
@@ -1019,8 +953,11 @@ function ReviewView({
                 </button>
                 <button
                   onClick={() => setShowSaveReportConfirm(true)}
-                  className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
-                  style={{ background: '#2563eb' }}
+                  className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110 transition-all duration-200"
+                  style={{
+                    background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
+                    boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
+                  }}
                 >
                   Confirm
                 </button>
@@ -1523,7 +1460,7 @@ export default function DoctorDashboard() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [view, setView] = useState<DoctorView>({ name: 'inbox' });
-  const [reviewRefreshKey, setReviewRefreshKey] = useState(0);
+  const [reviewRefreshKey] = useState(0);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [isDragging, setIsDragging] = useState(false);
