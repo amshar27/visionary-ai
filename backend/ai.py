@@ -979,6 +979,44 @@ Guideline text:
 
 
 # ======================================================
+# RAG: MULTI-AGENT VERSION (CrewAI)
+# ======================================================
+@router.post("/summarise-rag-crew")
+def generate_rag_summary_crew(screening_session_id: UUID):
+    """
+    Multi-agent version of /summarise-rag using CrewAI. Same input/output
+    contract — see /summarise-rag for the response shape.
+    """
+    try:
+        # Imported lazily so a missing crewai install doesn't block app boot.
+        from backend.agents.crew import run_clinical_report_crew
+        import json
+
+        result = run_clinical_report_crew(str(screening_session_id))
+
+        # CrewAI v0.86 returns a CrewOutput; .raw is the final task's output.
+        raw = result.raw if hasattr(result, "raw") else str(result)
+
+        # The writer task is instructed to emit JSON. If it complies, parse;
+        # otherwise treat the raw output as markdown.
+        try:
+            parsed = json.loads(raw)
+            return {
+                "rag_summary": parsed.get("rag_summary", raw),
+                "references": parsed.get("references", []),
+            }
+        except json.JSONDecodeError:
+            return {"rag_summary": raw, "references": []}
+
+    except Exception as e:
+        logger.error(f"Crew RAG generation failed: {e}")
+        return {
+            "rag_summary": f"**Error generating report:** {str(e)}\n\nPlease review raw results manually.",
+            "references": [],
+        }
+
+
+# ======================================================
 # RAG: EVALUATION ENDPOINT (RAGAS)
 # ======================================================
 @router.post("/evaluate-rag/{screening_session_id}")

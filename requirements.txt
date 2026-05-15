@@ -36,6 +36,8 @@ passlib==1.7.4
 PyJWT==2.10.1
 resend==2.5.1
 APScheduler==3.10.4
+pydantic[email]   # ← add this line
+markdown==3.7   # ← add this line
 
 # ── Image / PDF / HTTP ────────────────────────────────────
 pillow==11.0.0
