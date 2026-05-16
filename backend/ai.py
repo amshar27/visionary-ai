@@ -1,4 +1,3 @@
-# backend/ai.py
 import torch
 import torch.nn as nn
 import io
@@ -21,7 +20,7 @@ import numpy as np
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-# NEW IMPORTS FOR RAG
+# RAG IMPORTS
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI, ChatOpenAI as LCChatOpenAI
@@ -29,31 +28,19 @@ from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-from ragas import evaluate
-from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddingsWrapper
-try:
-    from ragas.metrics import faithfulness, answer_relevancy, context_relevancy
-    _context_metric = context_relevancy
-    _context_metric_name = "context_relevancy"
-except ImportError:
-    try:
-        from ragas.metrics import faithfulness, answer_relevancy, context_utilization
-        _context_metric = context_utilization
-        _context_metric_name = "context_utilization"
-    except ImportError:
-        from ragas.metrics import faithfulness, answer_relevancy
-        from ragas.metrics import ContextRelevance
-        _context_metric = ContextRelevance()
-        _context_metric_name = "ContextRelevance"
-from datasets import Dataset
 
+# RAGAS imports are deferred — evaluate-rag is never called from the frontend.
+# They are loaded lazily inside evaluate_rag() on first call.
+_ragas_loaded = False
+_ragas_evaluate = None
+_ragas_metrics = None
+_context_metric_name = "context_precision"
+_ragas_llm = None
+_ragas_embeddings = None
 
-client = OpenAI()      
+client = OpenAI()
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-# RAGAS-compatible wrappers
-ragas_llm = LangchainLLMWrapper(LCChatOpenAI(model="gpt-4o-mini", max_tokens=4000))
-ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
+
 # Initialize Vector Store
 vector_store = SupabaseVectorStore(
     client=supabase,
@@ -67,35 +54,31 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info(f"RAGAS context metric selected: {_context_metric_name}")
+logger.info(f"RAGAS context metric (will be loaded lazily): {_context_metric_name}")
 
 LOCKED_STATUSES = {"assigned", "approved", "overridden"}
 
 # ======================================================
 # MODEL CONFIGURATION
 # ======================================================
-NUM_CLASSES = 7  # Updated from 5 to 7
+NUM_CLASSES = 7
 ATTENTION_DIM = 512
 NUM_HEADS = 8
-# Updated classes array to match your training script exactly
 CLASSES = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative DR', 'Cataract', 'Glaucoma']
 
-# Renamed slightly for clarity, but keeping the dictionary keys mapped to the classes
 DISEASE_SEVERITY_MAP = {
     'No DR': 'none',
     'Mild': 'mild',
     'Moderate': 'moderate',
     'Severe': 'severe',
     'Proliferative DR': 'proliferative',
-    'Cataract': 'cataract',  # New mapping
-    'Glaucoma': 'glaucoma'   # New mapping
+    'Cataract': 'cataract',
+    'Glaucoma': 'glaucoma'
 }
 
-# Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f"Using device: {device}")
 
-# Image preprocessing
 test_transform = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
@@ -134,7 +117,6 @@ def load_model():
     global model
     try:
         model = ResNetWithAttention(num_classes=NUM_CLASSES).to(device)
-        # Update path to your model file location
         model.load_state_dict(torch.load('backend/model/best_model.pth', map_location=device))
         model.eval()
         logger.info("✅ Model loaded successfully")
@@ -142,7 +124,6 @@ def load_model():
         logger.error(f"❌ Error loading model: {str(e)}")
         raise
 
-# Load model on startup
 try:
     load_model()
 except Exception as e:
@@ -152,9 +133,6 @@ except Exception as e:
 # HELPER FUNCTIONS
 # ======================================================
 def download_image_from_supabase(image_url: str) -> Image.Image:
-    """
-    Download image from Supabase Storage URL and return PIL Image.
-    """
     try:
         response = requests.get(image_url, timeout=30)
         response.raise_for_status()
@@ -164,42 +142,33 @@ def download_image_from_supabase(image_url: str) -> Image.Image:
         logger.error(f"Failed to download image from {image_url}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to download image: {e}")
 
+
 def predict_image(image: Image.Image) -> Dict:
-    """
-    Run inference on a single image and return predictions.
-    """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    
+
     try:
-        # Preprocess image
         image_tensor = test_transform(image).unsqueeze(0).to(device)
-        
-        # Make prediction
+
         with torch.no_grad():
             outputs = model(image_tensor)
             probabilities = torch.nn.functional.softmax(outputs, dim=1)
             confidence, predicted = torch.max(probabilities, 1)
-        
-       # Extract results
+
         predicted_idx = predicted.item()
         predicted_class = CLASSES[predicted_idx]
         confidence_score = float(confidence.item())
-        
-        # Get all class probabilities
+
         class_probs = {
-            CLASSES[i]: float(probabilities[0][i].item()) 
+            CLASSES[i]: float(probabilities[0][i].item())
             for i in range(NUM_CLASSES)
         }
-        
-        # Determine disease presence and referability
-        dr_presence = predicted_idx > 0  # True if NOT 'No DR'
-        referable = predicted_idx >= 2   # Moderate DR, Severe, Proliferative, Cataract, and Glaucoma all require referral
-        
-        # Map to your database severity format (keeping variable name dr_severity so DB doesn't break)
+
+        dr_presence = predicted_idx > 0
+        referable = predicted_idx >= 2
+
         dr_severity = DISEASE_SEVERITY_MAP[predicted_class]
-        
-        # Determine follow-up interval based on severity
+
         follow_up_map = {
             'none': '12 months',
             'mild': '12 months',
@@ -210,25 +179,23 @@ def predict_image(image: Image.Image) -> Dict:
             'glaucoma': 'Urgent specialist referral'
         }
         follow_up_interval = follow_up_map.get(dr_severity, 'TBD')
-        
-        # Generate warnings based on specific diseases
+
         warnings = []
         if referable:
             warnings.append(f"Referable condition detected ({predicted_class}) - specialist referral recommended")
-        
-        if predicted_idx == 4:  # Proliferative DR
+
+        if predicted_idx == 4:
             warnings.append("Proliferative diabetic retinopathy - immediate referral required")
-        elif predicted_idx == 5: # Cataract
+        elif predicted_idx == 5:
             warnings.append("Cataract detected - comprehensive eye exam recommended")
-        elif predicted_idx == 6: # Glaucoma
+        elif predicted_idx == 6:
             warnings.append("Glaucoma suspect - urgent visual field and IOP testing recommended")
-            
+
         if confidence_score < 0.7:
             warnings.append("Low confidence prediction - manual review recommended")
-        
-        # Generate LLM-style summary
+
         llm_summary = generate_summary(predicted_class, confidence_score, dr_presence, referable)
-        
+
         return {
             "predicted_class": predicted_class,
             "dr_severity": dr_severity,
@@ -239,21 +206,18 @@ def predict_image(image: Image.Image) -> Dict:
             "follow_up_interval": follow_up_interval,
             "warnings": warnings,
             "llm_summary": llm_summary,
-            "macular_involvement": "no"  # This requires separate detection
+            "macular_involvement": "no"
         }
-        
+
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
+
 def generate_summary(predicted_class: str, confidence: float, dr_presence: bool, referable: bool) -> str:
-    """
-    Generate a human-readable summary of the AI analysis using OpenAI LLM.
-    """
     try:
-        # Prompt the LLM with the specific results
         system_msg = "You are an expert ophthalmologist AI. Write a concise, professional 1-sentence summary for a patient screening report."
-        
+
         user_msg = f"""
         Results:
         - Diagnosis: {predicted_class}
@@ -272,58 +236,39 @@ def generate_summary(predicted_class: str, confidence: float, dr_presence: bool,
             temperature=0.3,
             max_tokens=200
         )
-        
+
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        # Fallback if OpenAI fails
         logger.error(f"Summary Error: {e}")
         return f"AI Diagnosis: {predicted_class} ({confidence:.1%}). Please consult a doctor."
 
+
 def generate_heatmap(image_tensor, original_image_pil, predicted_class_idx):
-    """
-    Generates a Grad-CAM heatmap overlay.
-    """
     try:
-        # 1. Select the target layer (Last convolutional layer of ResNet backbone)
-        # In your ResNetWithAttention, self.backbone is a Sequential model.
-        # We target the last layer of that sequence.
         target_layers = [model.backbone[-1][-1]]
-
-        # 2. Initialize GradCAM
         cam = GradCAM(model=model, target_layers=target_layers)
-
-        # 3. Define the target (the class we want to explain, e.g., 'Severe DR')
         targets = [ClassifierOutputTarget(predicted_class_idx)]
-
-        # 4. Generate the grayscale CAM mask
         grayscale_cam = cam(input_tensor=image_tensor, targets=targets)
-        grayscale_cam = grayscale_cam[0, :]  # Take the first item in batch
+        grayscale_cam = grayscale_cam[0, :]
 
-        # 5. Prepare original image for blending
-        # Resize original image to match model input size (224x224) for visualization
         img_resized = original_image_pil.resize((224, 224))
         rgb_img = np.float32(img_resized) / 255
-        
-        # 6. Create the heatmap overlay (The "Red Blob")
+
         visualization = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
-        
-        # 7. Convert back to PIL Image for saving
         result_image = Image.fromarray(visualization)
         return result_image
 
     except Exception as e:
         logger.error(f"Heatmap generation failed: {e}")
         return None
+
+
 # ======================================================
 # API ENDPOINTS
 # ======================================================
 @router.post("/analyze")
 def analyze(screening_session_id: UUID):
-    """
-    Analyze retinal images for a screening session using the trained model.
-    """
-    # 1) Check session exists
     s = (
         supabase.table("screening_sessions")
         .select("*")
@@ -336,28 +281,25 @@ def analyze(screening_session_id: UUID):
     session = s.data[0]
     status = (session.get("status") or "").lower()
 
-    # Lock rules
     if status in LOCKED_STATUSES:
         raise HTTPException(
             status_code=403,
             detail=f"Session locked (status={status})."
         )
 
-    # 2) Fetch retinal images with their URLs
     imgs = (
         supabase.table("retinal_images")
         .select("eye_side, image_url, id")
         .eq("screening_session_id", str(screening_session_id))
         .execute()
     )
-    
+
     if not imgs.data:
         raise HTTPException(
             status_code=400,
             detail="No images found for this screening session."
         )
-    
-    # Check both eyes are present
+
     eye_sides = {(r.get("eye_side") or "").lower() for r in imgs.data}
     if not {"left", "right"}.issubset(eye_sides):
         raise HTTPException(
@@ -365,71 +307,53 @@ def analyze(screening_session_id: UUID):
             detail="Both left and right images are required before analysis."
         )
 
-    # 3) Process each image with the model
     results = []
-    
+
     for img_record in imgs.data:
         eye_side = (img_record.get("eye_side") or "").lower()
         image_url = img_record.get("image_url")
-        
+
         if not image_url:
             logger.warning(f"No image URL for {eye_side} eye")
             continue
-        
+
         try:
-            # --- 1. Download Image ---
             logger.info(f"Processing {eye_side} eye image: {image_url}")
             image = download_image_from_supabase(image_url)
-            
-            # --- 2. Run Existing Prediction ---
-            # Keep this line! It handles all your logic for severity, warnings, and LLM summaries.
+
             prediction = predict_image(image)
-            
-            # --- 3. Generate Heatmap (NEW CODE) ---
+
             heatmap_url = None
             try:
-                # We need to recreate the tensor here to pass it to the heatmap generator
-                # (This is a small duplication of effort but keeps your code clean)
                 image_tensor = test_transform(image).unsqueeze(0).to(device)
-                
-                # Get the class index required for GradCAM (0=No DR, 1=Mild, etc.)
-                # We can map the string class back to an index
                 predicted_class_str = prediction["predicted_class"]
                 predicted_idx = CLASSES.index(predicted_class_str)
 
-                # Only generate heatmap if it's NOT "No DR" (optional optimization), 
-                # or just generate it for everything so users see where AI looked.
-                # Here we generate it for everything:
                 heatmap_img = generate_heatmap(image_tensor, image, predicted_idx)
-                
+
                 if heatmap_img:
-                    # Save heatmap to memory buffer
                     buf = io.BytesIO()
                     heatmap_img.save(buf, format='JPEG')
                     buf.seek(0)
                     file_bytes = buf.read()
-                    
-                    # Upload to Supabase
+
                     heatmap_filename = f"heatmap_{screening_session_id}_{eye_side}.jpg"
-                    bucket_name = "retinal-scans" # Matches your existing bucket
-                    
+                    bucket_name = "retinal-scans"
+
                     supabase.storage.from_(bucket_name).upload(
                         path=f"heatmaps/{heatmap_filename}",
                         file=file_bytes,
                         file_options={"content-type": "image/jpeg", "upsert": "true"}
                     )
-                    
-                    # Get Public URL
+
                     heatmap_url = supabase.storage.from_(bucket_name).get_public_url(f"heatmaps/{heatmap_filename}")
                     logger.info(f"Heatmap generated: {heatmap_url}")
 
             except Exception as hm_e:
-                # If heatmap fails, log it but DON'T crash the whole analysis
                 logger.error(f"Heatmap generation failed for {eye_side} eye: {hm_e}")
-            
-            # --- 4. Prepare Result Row (UPDATED) ---
+
             result_row = {
-               "screening_session_id": str(screening_session_id),
+                "screening_session_id": str(screening_session_id),
                 "eye": eye_side.lower(),
                 "disease_detected": prediction["dr_presence"],
                 "dr_severity": prediction["dr_severity"],
@@ -440,15 +364,14 @@ def analyze(screening_session_id: UUID):
                 "follow_up_interval": prediction["follow_up_interval"],
                 "warnings": [str(w) for w in prediction["warnings"]],
                 "class_probabilities": prediction["class_probabilities"],
-                "heatmap_url": heatmap_url  # <--- NEW FIELD ADDED HERE
+                "heatmap_url": heatmap_url
             }
-            
+
             results.append(result_row)
             logger.info(f"✅ {eye_side.capitalize()} eye: {prediction['predicted_class']} (confidence: {prediction['confidence_score']:.2%})")
-            
+
         except Exception as e:
             logger.error(f"Failed to process {eye_side} eye: {e}")
-            # Add error result
             results.append({
                 "screening_session_id": str(screening_session_id),
                 "eye": eye_side,
@@ -460,12 +383,10 @@ def analyze(screening_session_id: UUID):
                 "llm_summary": f"Analysis failed: {str(e)}",
                 "follow_up_interval": "manual_review",
                 "warnings": [f"Processing error: {str(e)}"],
-                "heatmap_url": None # Ensure field exists even on error
+                "heatmap_url": None
             })
 
-   # 4) Upsert results to database
     if not results:
-        # FIX: Prevent crash when no images were successfully processed
         logger.error("No valid results generated. Check if image URLs exist.")
         raise HTTPException(
             status_code=400,
@@ -486,7 +407,6 @@ def analyze(screening_session_id: UUID):
             detail=f"Failed to save AI results: {e}"
         )
 
-    # 5) Update session status -> analysed
     try:
         supabase.table("screening_sessions").update(
             {"status": "analysed"}
@@ -510,10 +430,6 @@ def analyze(screening_session_id: UUID):
 
 @router.get("/results/by-session/{screening_session_id}")
 def get_results_by_session(screening_session_id: UUID):
-    """
-    Returns all AI results for a screening session,
-    ordered newest-first (per eye).
-    """
     try:
         res = (
             supabase.table("ai_results")
@@ -538,13 +454,6 @@ class AIResultOverride(PydanticBaseModel):
 
 @router.patch("/result/{ai_result_id}")
 def override_ai_result(ai_result_id: str, body: AIResultOverride):
-    """
-    Allows a doctor to manually override the AI result for a single eye.
-    Nulls out confidence, referable, follow_up, llm_summary, and warnings.
-    Only updates disease_detected, disease_type, and severity_label.
-    Also invalidates the session-wide RAG summary because any single-eye edit
-    makes the existing report (which covers both eyes) stale.
-    """
     existing = (
         supabase.table("ai_results")
         .select("id, screening_session_id")
@@ -570,8 +479,6 @@ def override_ai_result(ai_result_id: str, body: AIResultOverride):
 
     supabase.table("ai_results").update(update_data).eq("id", ai_result_id).execute()
 
-    # Invalidate the session-wide RAG summary and any saved RAGAS scores —
-    # the report describes both eyes, so any single-eye edit makes it stale.
     try:
         supabase.table("ai_results").update(
             {"rag_summary": None, "ragas_scores": None}
@@ -589,9 +496,6 @@ def override_ai_result(ai_result_id: str, body: AIResultOverride):
 
 @router.get("/health")
 def health_check():
-    """
-    Check if the AI model is loaded and ready.
-    """
     return {
         "ok": True,
         "model_loaded": model is not None,
@@ -603,10 +507,6 @@ def health_check():
 
 @router.post("/reanalyze/{screening_session_id}")
 def reanalyze(screening_session_id: UUID):
-    """
-    Force re-analysis of a screening session (bypasses lock for admin use).
-    """
-    # Temporarily allow reanalysis by removing lock check
     s = (
         supabase.table("screening_sessions")
         .select("*")
@@ -615,17 +515,15 @@ def reanalyze(screening_session_id: UUID):
     )
     if not s.data:
         raise HTTPException(status_code=404, detail="Screening session not found")
-    
-    # Call analyze function
+
     return analyze(screening_session_id)
+
+
 # ======================================================
-# RAG: INGESTION (Run this once or when adding new papers)
+# RAG: INGESTION
 # ======================================================
 @router.get("/rag-summary/{session_id}")
 def get_rag_summary(session_id: UUID):
-    """
-    Returns the persisted RAG summary for a session, or null if not yet generated.
-    """
     try:
         res = (
             supabase.table("ai_results")
@@ -654,58 +552,45 @@ async def update_rag_summary(session_id: str, payload: dict):
 
 @router.post("/ingest-research")
 def ingest_research_papers(bucket_name: str = "guidelines"):
-    """
-    Downloads PDFs from Supabase Storage, splits them, and indexes them in Vector DB.
-    """
     try:
-        # 1. List files in the bucket
         files = supabase.storage.from_(bucket_name).list()
         if not files:
             return {"message": "No files found in storage bucket"}
 
         documents = []
-        
-        # 2. Process each file
+
         for file in files:
             file_name = file['name']
             if not file_name.endswith('.pdf'):
                 continue
-            
+
             logger.info(f"Processing {file_name}...")
-            
-            # Download file content
+
             file_data = supabase.storage.from_(bucket_name).download(file_name)
-            
-            # Save to temp file because PyPDFLoader expects a file path
+
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(file_data)
                 tmp_path = tmp.name
-            
-            # Load and split PDF
+
             loader = PyPDFLoader(tmp_path)
             raw_docs = loader.load()
-            
-            # Split into chunks (Critical for RAG)
+
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=200
             )
             docs = text_splitter.split_documents(raw_docs)
-            
-            # Add metadata (source file name)
+
             for doc in docs:
                 doc.metadata["source"] = file_name
-            
+
             documents.extend(docs)
-            
-            # Clean up temp file
             os.remove(tmp_path)
 
-        # 3. Upload vectors to Supabase
         if documents:
             vector_store.add_documents(documents)
             return {"message": f"Successfully ingested {len(documents)} chunks from {len(files)} files."}
-        
+
         return {"message": "No documents processed"}
 
     except Exception as e:
@@ -718,38 +603,29 @@ def ingest_research_papers(bucket_name: str = "guidelines"):
 # ======================================================
 @router.post("/summarise-rag")
 def generate_rag_summary(screening_session_id: UUID):
-    """
-    Generates a structured medical report including:
-    1. Doctor's Name (from 'staff_users')
-    2. Patient History & Current Diagnosis
-    3. RAG Guidelines
-    """
     try:
         # --- STEP 1: FETCH SESSION & DOCTOR CONTEXT ---
         session_res = (
             supabase.table("screening_sessions")
-            .select("patient_id, session_date, assigned_doctor_id") # Added assigned_doctor_id
+            .select("patient_id, session_date, assigned_doctor_id")
             .eq("id", str(screening_session_id))
             .single()
             .execute()
         )
         if not session_res.data:
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
         patient_id = session_res.data['patient_id']
         doctor_id = session_res.data.get('assigned_doctor_id')
         current_date_raw = session_res.data.get('session_date')
         current_date = current_date_raw[:10] if current_date_raw else "Unknown Date"
 
-        # --- NEW: FETCH DOCTOR'S NAME ---
-        doctor_name = "Doctor" # Default fallback
+        doctor_name = "Doctor"
         if doctor_id:
             try:
-                # Assuming your staff table has a 'name' or 'full_name' column. 
-                # Check your staff_users table schema if this fails.
                 doc_res = (
                     supabase.table("staff_users")
-                    .select("name") # Change to "full_name" if that is your column name
+                    .select("name")
                     .eq("id", doctor_id)
                     .single()
                     .execute()
@@ -760,16 +636,17 @@ def generate_rag_summary(screening_session_id: UUID):
                 logger.warning(f"Could not fetch doctor name: {e}")
 
         # --- STEP 2: FETCH PATIENT DETAILS ---
+        # NOTE: reads glaucoma_family_history and elevated_iop_history
+        # (correct column names from the patients table)
         patient_res = (
             supabase.table("patients")
-            .select("name, age, diabetes_known, diabetes_type, diabetes_duration_years, comorbidities, notes, family_history_glaucoma, elevated_iop, previous_eye_surgery, visual_symptoms")
+            .select("name, age, diabetes_known, diabetes_type, diabetes_duration_years, comorbidities, notes, glaucoma_family_history, elevated_iop_history, previous_eye_surgery, visual_symptoms")
             .eq("id", patient_id)
             .single()
             .execute()
         )
         pt = patient_res.data if patient_res.data else {}
-        
-        # Handle comorbidities list vs string
+
         comorbidities = pt.get('comorbidities')
         if isinstance(comorbidities, list):
             comorbidities_str = ", ".join(comorbidities)
@@ -782,8 +659,8 @@ def generate_rag_summary(screening_session_id: UUID):
         - Known Diabetic: {pt.get('diabetes_known', 'N/A')}
         - Type: {pt.get('diabetes_type', 'N/A')} ({pt.get('diabetes_duration_years', 0)} years)
         - Comorbidities: {comorbidities_str}
-        - Family History of Glaucoma: {pt.get('family_history_glaucoma', 'Unknown')}
-        - Previously Elevated IOP: {pt.get('elevated_iop', 'Unknown')}
+        - Family History of Glaucoma: {pt.get('glaucoma_family_history', 'Unknown')}
+        - Previously Elevated IOP: {pt.get('elevated_iop_history', 'Unknown')}
         - Previous Eye Surgery or Trauma: {pt.get('previous_eye_surgery', 'Unknown')}
         - Visual Symptoms: {pt.get('visual_symptoms', 'None')}
         - Clinical Notes: {pt.get('notes', 'None')}
@@ -799,12 +676,12 @@ def generate_rag_summary(screening_session_id: UUID):
             .limit(3)
             .execute()
         )
-        
+
         past_history_str = "No previous screening records found."
         if past_sessions.data:
             past_lines = []
             for s in past_sessions.data:
-                old_res = supabase.table("ai_results").select("eye, dr_severity").eq("screening_session_id", s['id']).execute()
+                old_res = supabase.table("ai_results").select("eye, dr_severity, severity_label").eq("screening_session_id", s['id']).execute()
                 s_date = s['session_date'][:10] if s['session_date'] else "Unknown"
                 if old_res.data:
                     res_summary = ", ".join([
@@ -824,19 +701,17 @@ def generate_rag_summary(screening_session_id: UUID):
             .eq("screening_session_id", str(screening_session_id))
             .execute()
         )
-        
+
         if not ai_res.data:
             raise HTTPException(status_code=404, detail="No AI analysis found. Run /analyze first.")
 
         severity_levels = {'none': 0, 'mild': 1, 'moderate': 2, 'severe': 3, 'proliferative': 4}
         worst_severity_score = -1
         worst_condition_name = "No DR"
-        
+
         diagnostic_lines = []
         for result in ai_res.data:
             eye = (result.get('eye') or '').capitalize()
-            # Doctor-edited eyes have dr_severity nulled out by PATCH /ai/result/{id}
-            # but retain a non-null severity_label set by the doctor.
             is_edited = result.get('dr_severity') is None and result.get('severity_label') is not None
             severity = result.get('dr_severity') or result.get('severity_label') or 'none'
             confidence = result.get('confidence_score') or 0.0
@@ -857,18 +732,17 @@ def generate_rag_summary(screening_session_id: UUID):
                 diagnostic_lines.append(
                     f"- **{eye} Eye**: Prediction: {label} | Confidence: {confidence:.1%}"
                 )
-        
+
         diagnostic_data_str = "\n".join(diagnostic_lines)
 
         # --- STEP 5: RAG RETRIEVAL ---
-        # Format the query based on whether it's DR or one of the new diseases
         if worst_condition_name.lower() in ['cataract', 'glaucoma']:
             search_query = f"management and referral guidelines for {worst_condition_name} Malaysia"
         else:
             search_query = f"management and referral guidelines for {worst_condition_name} diabetic retinopathy Malaysia"
-            
+
         query_vector = embeddings.embed_query(search_query)
-        
+
         rpc_response = supabase.rpc(
             "match_documents",
             {
@@ -877,7 +751,7 @@ def generate_rag_summary(screening_session_id: UUID):
                 "match_count": 5
             }
         ).execute()
-        
+
         retrieved_docs = rpc_response.data or []
         if retrieved_docs:
             context_text = "\n\n".join([f"[Source: {d.get('metadata', {}).get('source', 'Guidelines')}] {d.get('content', '')}" for d in retrieved_docs])
@@ -957,7 +831,6 @@ Guideline text:
         final_report = response.choices[0].message.content
         sources = list(set([d.get('metadata', {}).get('source', 'Unknown') for d in retrieved_docs]))
 
-        # Persist RAG summary to ai_results rows for this session
         try:
             supabase.table("ai_results").update(
                 {"rag_summary": final_report}
@@ -966,7 +839,7 @@ Guideline text:
             print(f"[ai.py] Failed to persist rag_summary: {save_err}")
 
         return {
-            "rag_summary": final_report, 
+            "rag_summary": final_report,
             "references": sources
         }
 
@@ -984,29 +857,33 @@ Guideline text:
 @router.post("/summarise-rag-crew")
 def generate_rag_summary_crew(screening_session_id: UUID):
     """
-    Multi-agent version of /summarise-rag using CrewAI. Same input/output
-    contract — see /summarise-rag for the response shape.
+    Multi-agent version of /summarise-rag using CrewAI.
+    Same input/output contract as /summarise-rag.
     """
+    import re
+    
     try:
-        # Imported lazily so a missing crewai install doesn't block app boot.
         from backend.agents.crew import run_clinical_report_crew
         import json
 
         result = run_clinical_report_crew(str(screening_session_id))
 
-        # CrewAI v0.86 returns a CrewOutput; .raw is the final task's output.
         raw = result.raw if hasattr(result, "raw") else str(result)
 
-        # The writer task is instructed to emit JSON. If it complies, parse;
-        # otherwise treat the raw output as markdown.
+        # The agent sometimes wraps its JSON output in ```json ... ``` fences,
+        # which makes json.loads fail. Strip the fences before parsing.
+        cleaned = raw.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(cleaned)
             return {
-                "rag_summary": parsed.get("rag_summary", raw),
+                "rag_summary": parsed.get("rag_summary", cleaned),
                 "references": parsed.get("references", []),
             }
         except json.JSONDecodeError:
-            return {"rag_summary": raw, "references": []}
+            return {"rag_summary": cleaned, "references": []}
 
     except Exception as e:
         logger.error(f"Crew RAG generation failed: {e}")
@@ -1024,7 +901,26 @@ def evaluate_rag(screening_session_id: UUID):
     """
     Evaluates the existing RAG summary for a session using RAGAS metrics:
     faithfulness, answer_relevancy, and context_precision.
+    RAGAS is imported lazily here — it is never called from the frontend.
     """
+    # --- Lazy RAGAS import (runs once, on first call) ---
+    global _ragas_loaded, _ragas_evaluate, _ragas_metrics, _ragas_llm, _ragas_embeddings
+    if not _ragas_loaded:
+        from ragas import evaluate as _ragas_evaluate
+        from ragas.llms import LangchainLLMWrapper
+        from ragas.embeddings import LangchainEmbeddingsWrapper
+        from langchain_openai import ChatOpenAI as LCChatOpenAI
+        from ragas.metrics import faithfulness, answer_relevancy, context_precision
+        from datasets import Dataset as _Dataset
+        _ragas_metrics = [faithfulness, answer_relevancy, context_precision]
+        _ragas_llm = LangchainLLMWrapper(LCChatOpenAI(model="gpt-4o-mini", max_tokens=4000))
+        _ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
+        _ragas_loaded = True
+        # Store Dataset in module scope so it's accessible below
+        globals()['_Dataset'] = _Dataset
+
+    from datasets import Dataset
+
     try:
         # --- STEP 1: Fetch existing RAG summary ---
         ai_res = (
@@ -1041,7 +937,7 @@ def evaluate_rag(screening_session_id: UUID):
         if not rag_summary:
             raise HTTPException(status_code=404, detail="No RAG summary found. Generate one first via /summarise-rag.")
 
-        # --- STEP 2: Rebuild worst_condition_name from saved dr_severity ---
+        # --- STEP 2: Rebuild worst_condition_name defensively ---
         severity_levels = {'none': 0, 'mild': 1, 'moderate': 2, 'severe': 3, 'proliferative': 4}
         worst_severity_score = -1
         worst_condition_name = "No DR"
@@ -1084,11 +980,11 @@ def evaluate_rag(screening_session_id: UUID):
             "contexts": [contexts],
         })
 
-        ragas_result = evaluate(
+        ragas_result = _ragas_evaluate(
             dataset=ragas_dataset,
-            metrics=[faithfulness, answer_relevancy, _context_metric],
-            llm=ragas_llm,
-            embeddings=ragas_embeddings,
+            metrics=_ragas_metrics,
+            llm=_ragas_llm,
+            embeddings=_ragas_embeddings,
         )
 
         df = ragas_result.to_pandas()
@@ -1105,14 +1001,14 @@ def evaluate_rag(screening_session_id: UUID):
             except (ValueError, TypeError):
                 continue
 
-        # --- STEP 6: Persist scores to ai_results (best-effort) ---
+        # --- STEP 6: Persist scores ---
         try:
             supabase.table("ai_results").update(
                 {"ragas_scores": scores}
             ).eq("screening_session_id", str(screening_session_id)).execute()
             logger.info(f"RAGAS scores persisted for session {screening_session_id}")
         except Exception as persist_err:
-            logger.warning(f"Failed to persist ragas_scores (column may not exist): {persist_err}")
+            logger.warning(f"Failed to persist ragas_scores: {persist_err}")
 
         return {
             "ok": True,
@@ -1138,7 +1034,6 @@ def rag_trace(screening_session_id: UUID):
     (no LLM calls, no DB writes) and returns trace data for FYP evaluation.
     """
     try:
-        # --- STEP 1: Fetch AI results ---
         ai_res = (
             supabase.table("ai_results")
             .select("*")
@@ -1149,25 +1044,23 @@ def rag_trace(screening_session_id: UUID):
         if not ai_res.data:
             raise HTTPException(status_code=404, detail="No AI results found for this session.")
 
-        # --- STEP 2: Determine worst severity (same logic as summarise-rag / evaluate-rag) ---
         severity_levels = {'none': 0, 'mild': 1, 'moderate': 2, 'severe': 3, 'proliferative': 4}
         worst_severity_score = -1
         worst_condition_name = "No DR"
 
         for result in ai_res.data:
-            severity = result['dr_severity']
+            # Defensive read — handles doctor-overridden rows where dr_severity is null
+            severity = result.get('dr_severity') or result.get('severity_label') or 'none'
             current_score = severity_levels.get(severity.lower(), 0)
             if current_score > worst_severity_score:
                 worst_severity_score = current_score
                 worst_condition_name = severity
 
-        # --- STEP 3: Rebuild search query (same conditional as existing endpoints) ---
         if worst_condition_name.lower() in ['cataract', 'glaucoma']:
             search_query = f"management and referral guidelines for {worst_condition_name} Malaysia"
         else:
             search_query = f"management and referral guidelines for {worst_condition_name} diabetic retinopathy Malaysia"
 
-        # --- STEP 4: Embed query and call match_documents RPC ---
         query_vector = embeddings.embed_query(search_query)
 
         rpc_response = supabase.rpc(
@@ -1181,7 +1074,6 @@ def rag_trace(screening_session_id: UUID):
 
         retrieved_docs = rpc_response.data or []
 
-        # --- STEP 5: Build retrieved_chunks with content preview ---
         retrieved_chunks = []
         for doc in retrieved_docs:
             content = doc.get("content", "")
@@ -1192,7 +1084,6 @@ def rag_trace(screening_session_id: UUID):
                 "content_preview": preview
             })
 
-        # --- STEP 6: Get existing rag_summary (if any) ---
         final_report = ai_res.data[0].get("rag_summary")
 
         return {

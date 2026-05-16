@@ -167,56 +167,52 @@ def assign_doctor(payload: AssignDoctorRequest):
 # ============================================================
 @router.get("/assigned-to/{doctor_id}")
 def list_assigned_to_doctor(doctor_id: UUID):
-    """
-    Returns screening sessions assigned to a doctor WITH:
-    - patient_name (from patients.name via patient_id FK)
-    - assigned_by_name (from staff_users.name via created_by FK)
-    """
     try:
         res = (
             supabase.table("screening_sessions")
-            .select(
-                """
-                id,
-                patient_id,
-                session_number,
-                session_date,
-                status,
-                created_by,
-                patients:patient_id ( name ),
-                created_by_user:created_by ( name )
-                """
-            )
+            .select("id, patient_id, session_number, session_date, status, created_by")
             .eq("assigned_doctor_id", str(doctor_id))
             .order("session_date", desc=True)
             .execute()
         )
 
         rows = res.data or []
+        if not rows:
+            return {"ok": True, "data": []}
+
+        # Collect unique IDs for batch lookups
+        patient_ids = list({r["patient_id"] for r in rows if r.get("patient_id")})
+        staff_ids = list({r["created_by"] for r in rows if r.get("created_by")})
+
+        # Batch fetch patient names
+        patient_map = {}
+        if patient_ids:
+            p_res = supabase.table("patients").select("id, name").in_("id", patient_ids).execute()
+            patient_map = {p["id"]: p["name"] for p in (p_res.data or [])}
+
+        # Batch fetch nurse names
+        staff_map = {}
+        if staff_ids:
+            s_res = supabase.table("staff_users").select("id, name").in_("id", staff_ids).execute()
+            staff_map = {s["id"]: s["name"] for s in (s_res.data or [])}
+
         out = []
-
         for r in rows:
-            patient_obj = r.get("patients") or {}
-            nurse_obj = r.get("created_by_user") or {}
-
-            out.append(
-                {
-                    "id": r.get("id"),
-                    "patient_id": r.get("patient_id"),
-                    "session_number": r.get("session_number"),
-                    "session_date": r.get("session_date"),
-                    "status": r.get("status"),
-                    "created_by": r.get("created_by"),
-                    "patient_name": patient_obj.get("name"),
-                    "assigned_by_name": nurse_obj.get("name"),
-                }
-            )
+            out.append({
+                "id": r.get("id"),
+                "patient_id": r.get("patient_id"),
+                "session_number": r.get("session_number"),
+                "session_date": r.get("session_date"),
+                "status": r.get("status"),
+                "created_by": r.get("created_by"),
+                "patient_name": patient_map.get(r.get("patient_id")),
+                "assigned_by_name": staff_map.get(r.get("created_by")),
+            })
 
         return {"ok": True, "data": out}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ============================================================
 # Needed for doctors_review page

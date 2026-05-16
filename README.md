@@ -13,6 +13,7 @@ A clinical-grade multi-disease retinal screening system built for Malaysian heal
 | Database | Supabase (PostgreSQL + Object Storage + pgvector) |
 | AI Model | PyTorch — ResNet152 + MultiheadAttention, 5 DR classes, Grad-CAM heatmaps |
 | LLM / RAG | GPT-4o-mini (per-eye summaries), GPT-4o (full clinical report), LangChain + Supabase vector store |
+| Multi-Agent Pipeline | CrewAI — Researcher (gpt-4o-mini) + Writer (gpt-4o) |
 | Email | Resend — appointment confirmation, 24-hour reminder, clinical report delivery |
 
 ---
@@ -68,7 +69,7 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 ### Doctor
 1. View assigned sessions in the inbox
 2. Inspect AI results and Grad-CAM heatmaps
-3. Generate a RAG-powered clinical report
+3. Generate a clinical report via a CrewAI multi-agent pipeline (Researcher + Writer agents)
 4. Approve or override the AI findings
 5. Send the report to the patient via email
 
@@ -114,7 +115,7 @@ visionary_ai/
 
 ## AI Pipeline
 
-The AI model (`ResNetWithAttention`) classifies retinal images into 5 diabetic retinopathy severity classes:
+The AI model (`ResNetWithAttention`) classifies retinal images into 7 classes (diabetic retinopathy severity, cataract, and glaucoma):
 
 | Class | Label |
 |---|---|
@@ -123,6 +124,8 @@ The AI model (`ResNetWithAttention`) classifies retinal images into 5 diabetic r
 | 2 | Moderate |
 | 3 | Severe |
 | 4 | Proliferative DR |
+| 5 | Cataract |
+| 6 | Glaucoma |
 
 After classification, Grad-CAM generates a heatmap overlay highlighting the regions that influenced the prediction. A GPT-4o-mini one-line summary is produced per eye. When the doctor triggers report generation, GPT-4o produces a full structured clinical report grounded in retrieved research documents (RAG via pgvector).
 

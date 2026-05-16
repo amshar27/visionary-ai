@@ -214,6 +214,11 @@ export const aiAPI = {
       })
       .then((r) => r.data),
 
+  summariseRAGCrew: async (sessionId: string) => {
+    const res = await api.post(`/ai/summarise-rag-crew?screening_session_id=${sessionId}`);
+    return res.data as RAGSummaryResponse;
+  },
+
   getRagSummary: (sessionId: string) =>
     api.get<{ rag_summary: string | null }>(`/ai/rag-summary/${sessionId}`).then((r) => r.data),
 

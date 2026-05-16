@@ -18,6 +18,7 @@ Clinical-grade eye disease screening system built as a Final Year Project for Ma
 | LLM (RAG reports) | OpenAI `gpt-4o` |
 | RAG pipeline | LangChain + OpenAI embeddings (`text-embedding-3-small`) + Supabase vector store |
 | RAG evaluation | RAGAS (`ragas` + HuggingFace `datasets`) — faithfulness, answer_relevancy, context_precision |
+| Multi-Agent Pipeline | CrewAI — two-agent crew (Researcher: gpt-4o-mini, Writer: gpt-4o) |
 | Auth | Custom bcrypt — no JWT; user object stored in `localStorage` |
 | Email | Resend (`RESEND_API_KEY`) |
 | Scheduler | APScheduler (BackgroundScheduler) — runs in-process |
@@ -70,7 +71,7 @@ visionary_ai/
 │   ├── patients.py               # /patients CRUD
 │   ├── screenings.py             # /screenings workflow + send-report
 │   ├── uploads.py                # /uploads/retinal (multipart, upserts by eye_side)
-│   ├── ai.py                     # /ai/* — model inference, Grad-CAM, RAG
+│   ├── ai.py                     # /ai/* — model inference, Grad-CAM, multi-agent RAG
 │   ├── staff.py                  # /staff/doctors
 │   ├── admin.py                  # /admin/* staff and patient management
 │   ├── appointments.py           # /appointments CRUD with 30-min overlap check
@@ -138,7 +139,7 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `GET /screenings/by-patient/{patient_id}` — list sessions for a patient
 - `POST /screenings/create` — creates session with auto-incremented `session_number`
 - `POST /screenings/assign-doctor` — sets `assigned_doctor_id` + status=assigned (blocked if locked)
-- `GET /screenings/assigned-to/{doctor_id}` — enriched inbox (joins patient name + nurse name)
+- `GET /screenings/assigned-to/{doctor_id}` — enriched inbox (patient name + nurse name). `patient_name` and `assigned_by_name` are resolved via batch lookups (separate queries to the `patients` and `staff_users` tables) rather than Supabase FK joins, because the joins returned null on this environment.
 - `GET /screenings/{id}` — single session (joins patient)
 - `GET /screenings/{id}/doctor-review/latest` — most recent doctor_reviews row
 - `POST /screenings/{id}/doctor-review` — inserts review, updates session status to approved/overridden. Blocked if status is already in `LOCKED_STATUSES` (`{approved, overridden}`). If `assigned_doctor_id` is set on the session, only that doctor may submit (returns 403 otherwise). When `decision="overridden"`, `override_reason` is required (returns 400 if missing/empty).
@@ -154,7 +155,7 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use. Not currently called by the frontend.
 - `GET /ai/results/by-session/{id}` — returns ai_results rows for session
 - `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and sets `warnings` to `[]`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately). After this PATCH, `disease_type` and `severity_label` are the only fields carrying the doctor's diagnosis. Also invalidates the session-wide RAG by setting `rag_summary` and `ragas_scores` to `null` on **all** `ai_results` rows for the session (not just the edited eye), because the report describes both eyes.
-- `POST /ai/summarise-rag?screening_session_id=` — generates full RAG clinical report via a 2-step LLM pipeline: (1) gpt-4o-mini extracts/condenses guidelines from retrieved docs, (2) gpt-4o writes the final structured report. Fetches patient history, doctor name, past session history, current AI results, then queries `match_documents` RPC (threshold=0.45, count=5). Search query is conditional: `"…for {condition} Malaysia"` for cataract/glaucoma, `"…for {condition} diabetic retinopathy Malaysia"` otherwise. Persists the report to `ai_results.rag_summary`. Defensively reads severity as `dr_severity or severity_label or 'none'` to handle doctor-overridden rows where `dr_severity` is null. Doctor-edited eyes are detected by `dr_severity is None and severity_label is not None` and formatted as `"- **{Eye} Eye**: {disease_type} — {severity} *(doctor-confirmed)*"` (no confidence score); AI-predicted eyes format as `"- **{Eye} Eye**: Prediction: {label} | Confidence: {x.x%}"`. **On any exception, returns `{rag_summary: "**Error generating report:** ...", references: []}` with HTTP 200 (does not raise)** — the frontend should check the body for an error prefix.
+- `POST /ai/summarise-rag-crew?screening_session_id=` — generates full RAG clinical report via a CrewAI two-agent pipeline. Agent 1 (Clinical Evidence Researcher, gpt-4o-mini) uses severity_classifier and guideline_retrieval tools to fetch and condense Malaysian ophthalmology guidelines. Agent 2 (Clinical Report Writer, gpt-4o) uses patient_context, screening_history, diagnostic_assembler, doctor_lookup, and report_persist tools to write and persist a six-section structured markdown report. Returns `{rag_summary, references}`. On exception returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:**"`.
 - `GET /ai/rag-summary/{id}` — returns persisted rag_summary field from the first ai_results row for the session
 - `PATCH /ai/rag-summary/{session_id}` — updates `rag_summary` on **all** `ai_results` rows for the session with the provided string. Accepts `{rag_summary: string}`. Used by the doctor report inline editor to persist manual edits. Returns `{ok: true, message: "RAG summary updated"}`.
 - `POST /ai/evaluate-rag/{screening_session_id}` — evaluates an existing RAG summary using RAGAS metrics (faithfulness, answer_relevancy, and context_relevancy/context_utilization/ContextRelevance — selected via try/except at import time depending on the installed RAGAS version, see `_context_metric_name` log line). Re-runs retrieval to build the evaluation dataset. Best-effort persists scores to `ai_results.ragas_scores`. Returns `{ok, session_id, condition, scores}`. Reads severity defensively. **Not currently called by the frontend** — used via direct HTTP for FYP evaluation.
@@ -382,16 +383,8 @@ severity = result.get('dr_severity') or result.get('severity_label') or 'none'
 ```
 This applies in `generate_rag_summary` and `evaluate_rag` in `ai.py` (already fixed). **`rag_trace` (`GET /ai/rag-trace/{id}`) is NOT yet fixed** — it reads `result['dr_severity']` directly (`ai.py:1120`) and will crash on overridden rows. Apply the defensive pattern to any future code that reads `dr_severity` from `ai_results` rows.
 
-### Glaucoma/IOP column names — RAG reads wrong columns
-The `patients` table (and `PatientCreate` Pydantic model, `Patient` TypeScript interface, and Nurse form) uses these column names:
-- `glaucoma_family_history`
-- `elevated_iop_history`
-
-But `generate_rag_summary` in `ai.py:765,785,786` reads them as:
-- `family_history_glaucoma`
-- `elevated_iop`
-
-This means the RAG report **always shows "Unknown"** for these two fields, regardless of what the nurse entered. To fix, change the SELECT in `ai.py:765` to `glaucoma_family_history, elevated_iop_history` and update the corresponding `pt.get(...)` calls. (`previous_eye_surgery` and `visual_symptoms` are correctly named on both sides.)
+### Glaucoma/IOP column names — RAG reads wrong columns — FIXED
+This bug is now **FIXED**. Previously `generate_rag_summary` read the glaucoma/IOP patient fields under the wrong column names (`family_history_glaucoma` / `elevated_iop`), so the RAG report always showed "Unknown" for them. The CrewAI crew pipeline's `patient_context` tool now correctly reads `glaucoma_family_history` and `elevated_iop_history` from the `patients` table.
 
 ### `RetinalImage.created_at` vs `uploaded_at`
 The `retinal_images` table column is `uploaded_at` (set in `uploads.py:82`). The TypeScript `RetinalImage` interface declares `created_at: string` instead. Read defensively if you need the timestamp from this row.
@@ -423,7 +416,7 @@ All backend responses follow one of two shapes:
 ```
 Exceptions to the wrapper pattern:
 - **Appointments** endpoints return the appointment object directly (`AppointmentOut` model). `POST /appointments` returns HTTP 201.
-- **`POST /ai/summarise-rag`** returns `{rag_summary, references}` (no `ok`). On internal exceptions, returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:** "`.
+- **`POST /ai/summarise-rag-crew`** returns `{rag_summary, references}` (no `ok`). On internal exceptions, returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:** "`.
 - **`GET /ai/rag-summary/{id}`** returns `{rag_summary: string | null}` (no `ok`).
 - **`PATCH /ai/rag-summary/{id}`** returns `{ok: true, message: "RAG summary updated"}`.
 - **`POST /screenings/{id}/send-report`** returns `{success: true}`.

@@ -26,6 +26,29 @@ const elevatedCardStyle: React.CSSProperties = {
   boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.08)',
 };
 
+// ─── Helper: extract patient name from session (handles nested join or flat) ──
+
+function extractPatientName(s: ScreeningSession): string {
+  const raw = s as unknown as Record<string, unknown>;
+  const nested = raw.patients as Record<string, unknown> | undefined;
+  return (
+    (nested?.name as string) ??
+    (raw.patient_name as string) ??
+    s.patient?.name ??
+    'Unknown'
+  );
+}
+
+function extractAssignedByName(s: ScreeningSession): string {
+  const raw = s as unknown as Record<string, unknown>;
+  const nested = raw.created_by_user as Record<string, unknown> | undefined;
+  return (
+    (nested?.name as string) ??
+    (raw.assigned_by_name as string) ??
+    '-'
+  );
+}
+
 // ─── Status badge ─────────────────────────────────────────────────────────────
 
 function StatusBadge({ status }: { status: string }) {
@@ -173,7 +196,6 @@ function InboxView({
       </div>
       <p className="text-sm mb-4 text-gray-500">These are screening sessions assigned to you.</p>
 
-      {/* Filter */}
       <div className="flex items-center gap-2 mb-4">
         <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Status:</span>
         {['all', 'assigned', 'approved', 'overridden'].map(opt => (
@@ -201,7 +223,6 @@ function InboxView({
       {!loading && filtered.length > 0 && (
         <>
           <p className="text-xs mb-3 text-gray-400">Showing {filtered.length} session(s).</p>
-          {/* Table header */}
           <div className="grid text-xs font-bold uppercase tracking-wide pb-2 mb-1 text-gray-400" style={{ gridTemplateColumns: '90px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #e5e7eb' }}>
             <span>Session No.</span><span>Date</span><span>Patient</span><span>Assigned By</span><span>Status</span><span>Action</span>
           </div>
@@ -209,8 +230,8 @@ function InboxView({
             const raw = s as unknown as Record<string, unknown>;
             const sessionNo = raw.session_number as number ?? '-';
             const sessionDate = raw.session_date as string ?? s.created_at;
-            const patientName = raw.patient_name as string ?? s.patient?.name ?? 'Unknown';
-            const assignedBy = raw.assigned_by_name as string ?? '-';
+            const patientName = extractPatientName(s);
+            const assignedBy = extractAssignedByName(s);
             const isFinalized = ['approved', 'overridden'].includes(s.status?.toLowerCase());
             return (
               <div key={s.id} className="grid items-center py-3" style={{ gridTemplateColumns: '90px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #f3f4f6' }}>
@@ -278,51 +299,28 @@ function ReviewView({
   const [images, setImages] = useState<RetinalImage[]>([]);
   const [aiResults, setAiResults] = useState<AIResult[]>([]);
   const [latestReview, setLatestReview] = useState<DoctorReview | null>(null);
-  const [showHeatmap, setShowHeatmap] = useState(true); // default true for doctor (matches Streamlit)
+  const [showHeatmap, setShowHeatmap] = useState(true);
   const [ragResult, setRagResult] = useState<RAGSummaryResponse | null>(null);
   const [ragLoading, setRagLoading] = useState(false);
   const [isEditingReport, setIsEditingReport] = useState(false);
   const [showSaveReportConfirm, setShowSaveReportConfirm] = useState(false);
   const reportEditorRef = useRef<RagReportEditorHandle>(null);
 
-  // Send report state
   const [showSendConfirm, setShowSendConfirm] = useState(false);
   const [sendingReport, setSendingReport] = useState(false);
-
-  // Override modal state (legacy — kept for submitting flag)
   const [submitting, setSubmitting] = useState(false);
 
-  // Per-eye edit mode
   const [leftEditing, setLeftEditing] = useState(false);
   const [rightEditing, setRightEditing] = useState(false);
-
-  // Per-eye confirmed (true once doctor has confirmed the edit)
   const [leftEdited, setLeftEdited] = useState(false);
   const [rightEdited, setRightEdited] = useState(false);
 
-  // Per-eye form values while in edit mode
-  const [leftEditForm, setLeftEditForm] = useState({
-    disease_detected: 'Yes',
-    disease_type: 'Diabetic Retinopathy',
-    severity: 'No DR',
-  });
-  const [rightEditForm, setRightEditForm] = useState({
-    disease_detected: 'Yes',
-    disease_type: 'Diabetic Retinopathy',
-    severity: 'No DR',
-  });
+  const [leftEditForm, setLeftEditForm] = useState({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
+  const [rightEditForm, setRightEditForm] = useState({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
 
-  // Confirmed override values (used when submitting the doctor review)
-  const [leftConfirmed, setLeftConfirmed] = useState<{
-    disease_type: string;
-    severity: string;
-  } | null>(null);
-  const [rightConfirmed, setRightConfirmed] = useState<{
-    disease_type: string;
-    severity: string;
-  } | null>(null);
+  const [leftConfirmed, setLeftConfirmed] = useState<{ disease_type: string; severity: string } | null>(null);
+  const [rightConfirmed, setRightConfirmed] = useState<{ disease_type: string; severity: string } | null>(null);
 
-  // Override confirmation modal
   const [showOverrideConfirm, setShowOverrideConfirm] = useState(false);
   const [pendingConfirmEye, setPendingConfirmEye] = useState<'left' | 'right' | null>(null);
 
@@ -336,7 +334,6 @@ function ReviewView({
         aiAPI.getRagSummary(sessionId),
       ]);
       setSession(sResp.data ?? null);
-      console.log('[ReviewView] session.patient:', (sResp.data as unknown as Record<string, unknown>)?.patients);
       setImages(imgResp.data ?? []);
       setAiResults(aiResp.data ?? []);
       setLatestReview(reviewResp.data ?? null);
@@ -350,7 +347,6 @@ function ReviewView({
 
   useEffect(() => {
     load();
-    // Reset edit state when session changes
     setLeftEditing(false);
     setRightEditing(false);
     setLeftEdited(false);
@@ -388,25 +384,15 @@ function ReviewView({
   };
 
   const handleEnterEditMode = (eye: 'left' | 'right') => {
-    const result = aiResults.find(
-      (r) => getEyeSide(r as unknown as Record<string, unknown>) === eye
-    );
+    const result = aiResults.find(r => getEyeSide(r as unknown as Record<string, unknown>) === eye);
     if (!result) return;
-
     const diseaseDetected = result.disease_detected ? 'Yes' : 'No';
     const diseaseType = result.disease_type ?? 'Diabetic Retinopathy';
     const severityOptions = getSeverityOptions(diseaseType, diseaseDetected);
     const severity = result.severity_label ?? severityOptions[0];
-
     const formValue = { disease_detected: diseaseDetected, disease_type: diseaseType, severity };
-
-    if (eye === 'left') {
-      setLeftEditForm(formValue);
-      setLeftEditing(true);
-    } else {
-      setRightEditForm(formValue);
-      setRightEditing(true);
-    }
+    if (eye === 'left') { setLeftEditForm(formValue); setLeftEditing(true); }
+    else { setRightEditForm(formValue); setRightEditing(true); }
   };
 
   const handleEditConfirm = (eye: 'left' | 'right') => {
@@ -419,56 +405,34 @@ function ReviewView({
     if (!eye) return;
     setShowOverrideConfirm(false);
     setPendingConfirmEye(null);
-
     const form = eye === 'left' ? leftEditForm : rightEditForm;
-    const result = aiResults.find(
-      (r) => getEyeSide(r as unknown as Record<string, unknown>) === eye
-    );
-    if (!result || !result.id) {
-      toast.error(`No AI result found for ${eye} eye`);
-      return;
-    }
-
+    const result = aiResults.find(r => getEyeSide(r as unknown as Record<string, unknown>) === eye);
+    if (!result || !result.id) { toast.error(`No AI result found for ${eye} eye`); return; }
     try {
       await aiAPI.overrideAiResult(result.id, {
         disease_detected: form.disease_detected === 'Yes',
         disease_type: form.disease_type,
         severity_label: form.severity,
       });
-
-      setAiResults((prev) =>
-        prev.map((r) => {
-          if (getEyeSide(r as unknown as Record<string, unknown>) === eye) {
-            return {
-              ...r,
-              disease_detected: form.disease_detected === 'Yes',
-              disease_type: form.disease_type,
-              severity_label: form.severity,
-              referable: undefined as unknown as boolean,
-              confidence_score: undefined as unknown as number,
-              follow_up_interval: undefined as unknown as string,
-              llm_summary: undefined as unknown as string,
-              warnings: [],
-            };
-          }
-          return r;
-        })
-      );
-
-      if (eye === 'left') {
-        setLeftEditing(false);
-        setLeftEdited(true);
-        setLeftConfirmed({ disease_type: form.disease_type, severity: form.severity });
-      } else {
-        setRightEditing(false);
-        setRightEdited(true);
-        setRightConfirmed({ disease_type: form.disease_type, severity: form.severity });
-      }
-
-      // Backend invalidates the session-wide rag_summary on edit; clear the
-      // local copy so the doctor regenerates before submitting/sending.
+      setAiResults(prev => prev.map(r => {
+        if (getEyeSide(r as unknown as Record<string, unknown>) === eye) {
+          return {
+            ...r,
+            disease_detected: form.disease_detected === 'Yes',
+            disease_type: form.disease_type,
+            severity_label: form.severity,
+            referable: undefined as unknown as boolean,
+            confidence_score: undefined as unknown as number,
+            follow_up_interval: undefined as unknown as string,
+            llm_summary: undefined as unknown as string,
+            warnings: [],
+          };
+        }
+        return r;
+      }));
+      if (eye === 'left') { setLeftEditing(false); setLeftEdited(true); setLeftConfirmed({ disease_type: form.disease_type, severity: form.severity }); }
+      else { setRightEditing(false); setRightEdited(true); setRightConfirmed({ disease_type: form.disease_type, severity: form.severity }); }
       setRagResult(null);
-
       toast.success(`${eye.charAt(0).toUpperCase() + eye.slice(1)} eye result updated`);
       toast('Clinical summary cleared — click Regenerate to update it', { icon: 'ℹ️' });
     } catch {
@@ -477,18 +441,10 @@ function ReviewView({
   };
 
   const handleSubmit = async () => {
-    const leftResult = aiResults.find(
-      (r) => getEyeSide(r as unknown as Record<string, unknown>) === 'left'
-    );
-    const rightResult = aiResults.find(
-      (r) => getEyeSide(r as unknown as Record<string, unknown>) === 'right'
-    );
-
-    const finalGradeLeft =
-      leftConfirmed?.severity ?? leftResult?.severity_label ?? leftResult?.dr_severity ?? null;
-    const finalGradeRight =
-      rightConfirmed?.severity ?? rightResult?.severity_label ?? rightResult?.dr_severity ?? null;
-
+    const leftResult = aiResults.find(r => getEyeSide(r as unknown as Record<string, unknown>) === 'left');
+    const rightResult = aiResults.find(r => getEyeSide(r as unknown as Record<string, unknown>) === 'right');
+    const finalGradeLeft = leftConfirmed?.severity ?? leftResult?.severity_label ?? leftResult?.dr_severity ?? null;
+    const finalGradeRight = rightConfirmed?.severity ?? rightResult?.severity_label ?? rightResult?.dr_severity ?? null;
     setSubmitting(true);
     try {
       await screeningsAPI.submitReview(sessionId, {
@@ -498,7 +454,6 @@ function ReviewView({
         final_dr_grade_left: finalGradeLeft ?? undefined,
         final_dr_grade_right: finalGradeRight ?? undefined,
       });
-
       toast.success('Session submitted successfully');
       onBack();
     } catch {
@@ -511,7 +466,7 @@ function ReviewView({
   const handleRAG = async () => {
     setRagLoading(true);
     try {
-      const result = await aiAPI.summariseRAG(sessionId);
+      const result = await aiAPI.summariseRAGCrew(sessionId);
       setRagResult(result);
       toast.success('Clinical summary generated.');
     } catch (err) {
@@ -535,14 +490,12 @@ function ReviewView({
   };
 
   const handleSendReport = async () => {
-    if (!ragResult) return;
-    const email = patientEmail;
-    if (!email) return;
+    if (!ragResult || !patientEmail) return;
     setSendingReport(true);
     try {
-      const pName = (session as unknown as Record<string, unknown>)?.patient_name as string ?? session?.patient?.name ?? 'Patient';
+      const pName = session ? extractPatientName(session) : 'Patient';
       await screeningsAPI.sendReport(sessionId, {
-        patient_email: email,
+        patient_email: patientEmail,
         report_html: ragResult.rag_summary,
         patient_name: pName,
       });
@@ -558,7 +511,7 @@ function ReviewView({
   const raw = session as unknown as Record<string, unknown> | null;
   const sessionNo = raw?.session_number as number ?? '-';
   const sessionDate = raw?.session_date as string ?? session?.created_at;
-  const patientName = raw?.patient_name as string ?? session?.patient?.name ?? 'Unknown patient';
+  const patientName = session ? extractPatientName(session) : 'Unknown patient';
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const patientEmail = (session as any)?.patients?.email as string | null;
 
@@ -583,111 +536,52 @@ function ReviewView({
 
       <hr style={{ borderColor: '#e5e7eb', margin: '16px 0' }} />
 
-      {/* AI Verdict */}
       <h3 className="text-base font-bold text-gray-900 mb-1">AI Verdict</h3>
       {!hasResults && (
         <p className="text-sm mb-4" style={{ color: '#ea580c' }}>No AI results found for this session yet.</p>
       )}
       {hasResults && (
         <>
-          <p className="text-xs mb-3 text-gray-500">
-            Toggle the switch to view Grad-CAM heatmap or original image for both eyes.
-          </p>
-          {/* Images only */}
+          <p className="text-xs mb-3 text-gray-500">Toggle the switch to view Grad-CAM heatmap or original image for both eyes.</p>
           <div className="grid grid-cols-2 gap-4 mb-2">
             <div style={elevatedCardStyle}><EyePanel title="Left Eye Diagnosis" result={leftRes} originalImg={leftImg} showHeatmap={showHeatmap} section="image" /></div>
             <div style={elevatedCardStyle}><EyePanel title="Right Eye Diagnosis" result={rightRes} originalImg={rightImg} showHeatmap={showHeatmap} section="image" /></div>
           </div>
-          {/* Heatmap toggle — right-aligned, below images, above DR stats */}
           <div className="flex justify-end mb-3">
             <HeatmapToggle value={showHeatmap} onChange={setShowHeatmap} />
           </div>
-          {/* Stats / Edit widgets */}
           <div className="grid grid-cols-2 gap-4 mb-3">
             {/* ── Left Eye Widget ── */}
             <div style={elevatedCardStyle}>
               {leftEditing ? (
-                /* STATE 2 — Edit mode */
                 <div>
                   <h4 className="text-sm font-bold text-gray-900 mb-3">Left Eye Diagnosis — Edit</h4>
                   <div className="space-y-3">
                     <div>
                       <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Detected</label>
-                      <select
-                        value={leftEditForm.disease_detected}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setLeftEditForm((prev) => ({
-                            ...prev,
-                            disease_detected: val,
-                            disease_type: val === 'No' ? 'N/A' : prev.disease_type,
-                            severity: getSeverityOptions(val === 'No' ? 'N/A' : prev.disease_type, val)[0],
-                          }));
-                        }}
-                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
-                        style={inputStyle}
-                      >
-                        <option>Yes</option>
-                        <option>No</option>
+                      <select value={leftEditForm.disease_detected} onChange={(e) => { const val = e.target.value; setLeftEditForm(prev => ({ ...prev, disease_detected: val, disease_type: val === 'No' ? 'N/A' : prev.disease_type, severity: getSeverityOptions(val === 'No' ? 'N/A' : prev.disease_type, val)[0] })); }} className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer" style={inputStyle}>
+                        <option>Yes</option><option>No</option>
                       </select>
                     </div>
                     <div>
                       <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Type</label>
-                      <select
-                        value={leftEditForm.disease_type}
-                        disabled={leftEditForm.disease_detected === 'No'}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setLeftEditForm((prev) => ({
-                            ...prev,
-                            disease_type: val,
-                            severity: getSeverityOptions(val, prev.disease_detected)[0],
-                          }));
-                        }}
-                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer disabled:opacity-50"
-                        style={inputStyle}
-                      >
-                        <option>Diabetic Retinopathy</option>
-                        <option>Cataract</option>
-                        <option>Glaucoma</option>
-                        <option>N/A</option>
+                      <select value={leftEditForm.disease_type} disabled={leftEditForm.disease_detected === 'No'} onChange={(e) => { const val = e.target.value; setLeftEditForm(prev => ({ ...prev, disease_type: val, severity: getSeverityOptions(val, prev.disease_detected)[0] })); }} className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer disabled:opacity-50" style={inputStyle}>
+                        <option>Diabetic Retinopathy</option><option>Cataract</option><option>Glaucoma</option><option>N/A</option>
                       </select>
                     </div>
                     <div>
                       <label className="text-xs font-semibold text-gray-500 block mb-1">Severity</label>
-                      <select
-                        value={leftEditForm.severity}
-                        onChange={(e) =>
-                          setLeftEditForm((prev) => ({ ...prev, severity: e.target.value }))
-                        }
-                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
-                        style={inputStyle}
-                      >
-                        {getSeverityOptions(leftEditForm.disease_type, leftEditForm.disease_detected).map((opt) => (
-                          <option key={opt}>{opt}</option>
-                        ))}
+                      <select value={leftEditForm.severity} onChange={(e) => setLeftEditForm(prev => ({ ...prev, severity: e.target.value }))} className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer" style={inputStyle}>
+                        {getSeverityOptions(leftEditForm.disease_type, leftEditForm.disease_detected).map(opt => <option key={opt}>{opt}</option>)}
                       </select>
                     </div>
                     <div className="flex gap-2 pt-1">
-                      <button
-                        onClick={() => setLeftEditing(false)}
-                        className="flex-1 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
-                        style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={() => handleEditConfirm('left')}
-                        className="flex-1 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
-                        style={{ background: '#f97316' }}
-                      >
-                        Confirm
-                      </button>
+                      <button onClick={() => setLeftEditing(false)} className="flex-1 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+                      <button onClick={() => handleEditConfirm('left')} className="flex-1 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200" style={{ background: '#f97316' }}>Confirm</button>
                     </div>
                   </div>
                 </div>
               ) : leftEdited ? (
-                /* STATE 3 — Post-confirm collapsed display */
                 <div>
                   <div className="flex items-center gap-2 mb-2">
                     <h4 className="text-sm font-bold text-gray-900">Left Eye Diagnosis</h4>
@@ -700,27 +594,9 @@ function ReviewView({
                   </div>
                 </div>
               ) : (
-                /* STATE 1 — Normal display */
                 <div className="relative">
                   {!isLocked && (
-                    <button
-                      onClick={() => ragResult ? handleEnterEditMode('left') : undefined}
-                      disabled={!ragResult}
-                      title={!ragResult ? 'Generate Clinical Report Summary first' : undefined}
-                      className={`absolute top-0 right-0 text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 ${
-                        ragResult
-                          ? 'cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110'
-                          : 'cursor-not-allowed opacity-40 grayscale'
-                      }`}
-                      style={ragResult ? {
-                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
-                        boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
-                      } : {
-                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
-                      }}
-                    >
-                      Edit
-                    </button>
+                    <button onClick={() => ragResult ? handleEnterEditMode('left') : undefined} disabled={!ragResult} title={!ragResult ? 'Generate Clinical Report Summary first' : undefined} className={`absolute top-0 right-0 text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 ${ragResult ? 'cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110' : 'cursor-not-allowed opacity-40 grayscale'}`} style={ragResult ? { background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' } : { background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)' }}>Edit</button>
                   )}
                   <EyePanel title="Left Eye Diagnosis" result={leftRes} originalImg={leftImg} showHeatmap={showHeatmap} section="stats" />
                 </div>
@@ -730,87 +606,34 @@ function ReviewView({
             {/* ── Right Eye Widget ── */}
             <div style={elevatedCardStyle}>
               {rightEditing ? (
-                /* STATE 2 — Edit mode */
                 <div>
                   <h4 className="text-sm font-bold text-gray-900 mb-3">Right Eye Diagnosis — Edit</h4>
                   <div className="space-y-3">
                     <div>
                       <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Detected</label>
-                      <select
-                        value={rightEditForm.disease_detected}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setRightEditForm((prev) => ({
-                            ...prev,
-                            disease_detected: val,
-                            disease_type: val === 'No' ? 'N/A' : prev.disease_type,
-                            severity: getSeverityOptions(val === 'No' ? 'N/A' : prev.disease_type, val)[0],
-                          }));
-                        }}
-                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
-                        style={inputStyle}
-                      >
-                        <option>Yes</option>
-                        <option>No</option>
+                      <select value={rightEditForm.disease_detected} onChange={(e) => { const val = e.target.value; setRightEditForm(prev => ({ ...prev, disease_detected: val, disease_type: val === 'No' ? 'N/A' : prev.disease_type, severity: getSeverityOptions(val === 'No' ? 'N/A' : prev.disease_type, val)[0] })); }} className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer" style={inputStyle}>
+                        <option>Yes</option><option>No</option>
                       </select>
                     </div>
                     <div>
                       <label className="text-xs font-semibold text-gray-500 block mb-1">Disease Type</label>
-                      <select
-                        value={rightEditForm.disease_type}
-                        disabled={rightEditForm.disease_detected === 'No'}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setRightEditForm((prev) => ({
-                            ...prev,
-                            disease_type: val,
-                            severity: getSeverityOptions(val, prev.disease_detected)[0],
-                          }));
-                        }}
-                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer disabled:opacity-50"
-                        style={inputStyle}
-                      >
-                        <option>Diabetic Retinopathy</option>
-                        <option>Cataract</option>
-                        <option>Glaucoma</option>
-                        <option>N/A</option>
+                      <select value={rightEditForm.disease_type} disabled={rightEditForm.disease_detected === 'No'} onChange={(e) => { const val = e.target.value; setRightEditForm(prev => ({ ...prev, disease_type: val, severity: getSeverityOptions(val, prev.disease_detected)[0] })); }} className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer disabled:opacity-50" style={inputStyle}>
+                        <option>Diabetic Retinopathy</option><option>Cataract</option><option>Glaucoma</option><option>N/A</option>
                       </select>
                     </div>
                     <div>
                       <label className="text-xs font-semibold text-gray-500 block mb-1">Severity</label>
-                      <select
-                        value={rightEditForm.severity}
-                        onChange={(e) =>
-                          setRightEditForm((prev) => ({ ...prev, severity: e.target.value }))
-                        }
-                        className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer"
-                        style={inputStyle}
-                      >
-                        {getSeverityOptions(rightEditForm.disease_type, rightEditForm.disease_detected).map((opt) => (
-                          <option key={opt}>{opt}</option>
-                        ))}
+                      <select value={rightEditForm.severity} onChange={(e) => setRightEditForm(prev => ({ ...prev, severity: e.target.value }))} className="w-full px-3 py-2 rounded-xl text-sm outline-none cursor-pointer" style={inputStyle}>
+                        {getSeverityOptions(rightEditForm.disease_type, rightEditForm.disease_detected).map(opt => <option key={opt}>{opt}</option>)}
                       </select>
                     </div>
                     <div className="flex gap-2 pt-1">
-                      <button
-                        onClick={() => setRightEditing(false)}
-                        className="flex-1 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
-                        style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={() => handleEditConfirm('right')}
-                        className="flex-1 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
-                        style={{ background: '#f97316' }}
-                      >
-                        Confirm
-                      </button>
+                      <button onClick={() => setRightEditing(false)} className="flex-1 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+                      <button onClick={() => handleEditConfirm('right')} className="flex-1 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200" style={{ background: '#f97316' }}>Confirm</button>
                     </div>
                   </div>
                 </div>
               ) : rightEdited ? (
-                /* STATE 3 — Post-confirm collapsed display */
                 <div>
                   <div className="flex items-center gap-2 mb-2">
                     <h4 className="text-sm font-bold text-gray-900">Right Eye Diagnosis</h4>
@@ -823,27 +646,9 @@ function ReviewView({
                   </div>
                 </div>
               ) : (
-                /* STATE 1 — Normal display */
                 <div className="relative">
                   {!isLocked && (
-                    <button
-                      onClick={() => ragResult ? handleEnterEditMode('right') : undefined}
-                      disabled={!ragResult}
-                      title={!ragResult ? 'Generate Clinical Report Summary first' : undefined}
-                      className={`absolute top-0 right-0 text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 ${
-                        ragResult
-                          ? 'cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110'
-                          : 'cursor-not-allowed opacity-40 grayscale'
-                      }`}
-                      style={ragResult ? {
-                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
-                        boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
-                      } : {
-                        background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
-                      }}
-                    >
-                      Edit
-                    </button>
+                    <button onClick={() => ragResult ? handleEnterEditMode('right') : undefined} disabled={!ragResult} title={!ragResult ? 'Generate Clinical Report Summary first' : undefined} className={`absolute top-0 right-0 text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 ${ragResult ? 'cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110' : 'cursor-not-allowed opacity-40 grayscale'}`} style={ragResult ? { background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' } : { background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)' }}>Edit</button>
                   )}
                   <EyePanel title="Right Eye Diagnosis" result={rightRes} originalImg={rightImg} showHeatmap={showHeatmap} section="stats" />
                 </div>
@@ -855,7 +660,6 @@ function ReviewView({
 
       <hr style={{ borderColor: '#e5e7eb', margin: '16px 0' }} />
 
-      {/* Doctor Override display (if overridden) */}
       {latestReview?.decision === 'overridden' && (
         <>
           <h3 className="text-base font-bold text-gray-900 mb-2">Final Verdict (Doctor Override)</h3>
@@ -872,25 +676,15 @@ function ReviewView({
         </>
       )}
 
-      {/* 1. Generate button — always visible, centred */}
+      {/* Generate button */}
       <div className="flex flex-col items-center mb-6">
-        <button
-          onClick={handleRAG}
-          disabled={isLocked || !hasResults || ragLoading}
-          className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-          style={{ background: '#7c3aed', boxShadow: '0 8px 28px rgba(124,58,237,0.45)' }}
-        >
+        <button onClick={handleRAG} disabled={isLocked || !hasResults || ragLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#7c3aed', boxShadow: '0 8px 28px rgba(124,58,237,0.45)' }}>
           🧠 {ragLoading ? 'Generating…' : 'Generate Clinical Report Summary'}
         </button>
-        {!hasResults && (
-          <p className="mt-2 text-sm text-gray-500 text-center">AI results are required before generating a summary.</p>
-        )}
-        {hasResults && !isLocked && !ragResult && (
-          <p className="mt-2 text-sm text-gray-500 text-center">Generate this Report Summary to unlock Approve and Override (edit) options.</p>
-        )}
+        {!hasResults && <p className="mt-2 text-sm text-gray-500 text-center">AI results are required before generating a summary.</p>}
+        {hasResults && !isLocked && !ragResult && <p className="mt-2 text-sm text-gray-500 text-center">Generate this Report Summary to unlock Approve and Override (edit) options.</p>}
       </div>
 
-      {/* 2. RAG loading indicator */}
       {ragLoading && (
         <div className="flex items-center gap-3 px-4 py-3 rounded-xl mb-4 text-sm" style={{ background: '#faf5ff', border: '1px solid #e9d5ff', color: '#7c3aed' }}>
           <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin shrink-0" />
@@ -898,69 +692,24 @@ function ReviewView({
         </div>
       )}
 
-      {/* 3. Summary box — appears directly below the button once generated */}
       {ragResult && (
-        <div
-          className="bg-white rounded-xl border-l-4 mb-6"
-          style={{ borderLeftColor: '#2563eb', padding: '28px 32px', boxShadow: '0 20px 60px rgba(0,0,0,0.15)' }}
-        >
-          {/* Header */}
+        <div className="bg-white rounded-xl border-l-4 mb-6" style={{ borderLeftColor: '#2563eb', padding: '28px 32px', boxShadow: '0 20px 60px rgba(0,0,0,0.15)' }}>
           <div className="flex items-center gap-2 mb-5">
             <span className="text-xl">📋</span>
             <h4 className="text-base font-semibold text-gray-800">AI Clinical Summary</h4>
-            <span className="ml-auto text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: '#dbeafe', color: '#1d4ed8' }}>
-              Based on Research
-            </span>
-            {ragResult && !isLocked && !isEditingReport && (
-              <button
-                onClick={() => setIsEditingReport(true)}
-                className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110"
-                style={{
-                  background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
-                  boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
-                }}
-              >
-                Edit
-              </button>
+            <span className="ml-auto text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: '#dbeafe', color: '#1d4ed8' }}>Based on Research</span>
+            {!isLocked && !isEditingReport && (
+              <button onClick={() => setIsEditingReport(true)} className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-all duration-200 cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110" style={{ background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' }}>Edit</button>
             )}
-            {isEditingReport && (
-              <span
-                className="text-xs font-medium px-2 py-0.5 rounded-full"
-                style={{ background: '#fef3c7', color: '#b45309' }}
-              >
-                Editing
-              </span>
-            )}
+            {isEditingReport && <span className="text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#b45309' }}>Editing</span>}
           </div>
-
           <hr style={{ borderColor: '#e5e7eb', marginBottom: 20 }} />
-
-          {/* WYSIWYG editor (TipTap) or read-only markdown view */}
           {isEditingReport ? (
             <>
-              <RagReportEditor
-                key={sessionId}
-                ref={reportEditorRef}
-                initialMarkdown={ragResult.rag_summary}
-              />
+              <RagReportEditor key={sessionId} ref={reportEditorRef} initialMarkdown={ragResult.rag_summary} />
               <div className="flex justify-end gap-3 mt-4">
-                <button
-                  onClick={() => setIsEditingReport(false)}
-                  className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
-                  style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={() => setShowSaveReportConfirm(true)}
-                  className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110 transition-all duration-200"
-                  style={{
-                    background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
-                    boxShadow: '0 4px 14px rgba(220,38,38,0.4)',
-                  }}
-                >
-                  Confirm
-                </button>
+                <button onClick={() => setIsEditingReport(false)} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+                <button onClick={() => setShowSaveReportConfirm(true)} className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:scale-[1.05] active:scale-[0.97] hover:brightness-110 transition-all duration-200" style={{ background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' }}>Confirm</button>
               </div>
             </>
           ) : (
@@ -968,179 +717,88 @@ function ReviewView({
               <ReactMarkdown>{ragResult.rag_summary}</ReactMarkdown>
             </div>
           )}
-
         </div>
       )}
 
-      {/* 3b. Placeholder — shown when a doctor edit has invalidated the saved summary */}
       {!ragResult && !ragLoading && (leftEdited || rightEdited) && (
-        <div
-          className="bg-white rounded-xl border-l-4 mb-6"
-          style={{ borderLeftColor: '#f59e0b', padding: '24px 28px', boxShadow: '0 10px 30px rgba(0,0,0,0.08)' }}
-        >
+        <div className="bg-white rounded-xl border-l-4 mb-6" style={{ borderLeftColor: '#f59e0b', padding: '24px 28px', boxShadow: '0 10px 30px rgba(0,0,0,0.08)' }}>
           <div className="flex items-center gap-2 mb-3">
             <span className="text-xl">⚠️</span>
             <h4 className="text-base font-semibold text-gray-800">AI Clinical Summary</h4>
-            <span className="ml-auto text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#b45309' }}>
-              Needs Regeneration
-            </span>
+            <span className="ml-auto text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: '#fef3c7', color: '#b45309' }}>Needs Regeneration</span>
           </div>
-          <p className="text-sm text-gray-600 mb-4">
-            Clinical summary needs regeneration after the diagnosis edit.
-          </p>
-          <button
-            onClick={handleRAG}
-            disabled={ragLoading || isLocked || !hasResults}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-            style={{ background: '#7c3aed', boxShadow: '0 6px 20px rgba(124,58,237,0.35)' }}
-          >
+          <p className="text-sm text-gray-600 mb-4">Clinical summary needs regeneration after the diagnosis edit.</p>
+          <button onClick={handleRAG} disabled={ragLoading || isLocked || !hasResults} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#7c3aed', boxShadow: '0 6px 20px rgba(124,58,237,0.35)' }}>
             🧠 {ragLoading ? 'Regenerating…' : 'Regenerate Clinical Summary'}
           </button>
         </div>
       )}
 
-      {/* 4. Doctor Actions — only rendered after summary exists (or session already finalized) */}
       {(ragResult !== null || isLocked) && (
         <>
           <hr style={{ borderColor: '#e5e7eb', margin: '16px 0' }} />
           <h3 className="text-lg font-semibold text-gray-900 mt-8 mb-4">Doctor Actions</h3>
           <div className="flex flex-wrap justify-center gap-4 mb-6">
             {(leftEdited || rightEdited) ? (
-              <button
-                onClick={handleSubmit}
-                disabled={isLocked || !hasResults || submitting}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-                style={{ boxShadow: '0 8px 24px rgba(249,115,22,0.45)' }}
-              >
+              <button onClick={handleSubmit} disabled={isLocked || !hasResults || submitting} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(249,115,22,0.45)' }}>
                 {submitting ? 'Submitting…' : '✍️ Submit'}
               </button>
             ) : (
-              <button
-                onClick={handleApprove}
-                disabled={isLocked || !hasResults || submitting}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-                style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}
-              >
+              <button onClick={handleApprove} disabled={isLocked || !hasResults || submitting} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
                 ✅ Approve
               </button>
             )}
             {ragResult && (
-              <button
-                onClick={() => {
-                  if (!patientEmail) {
-                    toast.error('Patient has no email on record.');
-                    return;
-                  }
-                  setShowSendConfirm(true);
-                }}
-                disabled={sendingReport}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-                style={{ boxShadow: '0 8px 24px rgba(59,130,246,0.45)' }}
-              >
-                <Mail size={15} />
-                Send Report to Patient
+              <button onClick={() => { if (!patientEmail) { toast.error('Patient has no email on record.'); return; } setShowSendConfirm(true); }} disabled={sendingReport} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(59,130,246,0.45)' }}>
+                <Mail size={15} /> Send Report to Patient
               </button>
             )}
           </div>
         </>
       )}
 
-      {/* Send Report Confirmation Modal */}
+      {/* Modals */}
       {showSendConfirm && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-6 shadow-xl max-w-sm w-full mx-4">
-            <div className="flex items-center gap-2 mb-3">
-              <Mail size={18} className="text-blue-600" />
-              <h3 className="text-base font-semibold text-gray-900">Send Report to Patient</h3>
-            </div>
+            <div className="flex items-center gap-2 mb-3"><Mail size={18} className="text-blue-600" /><h3 className="text-base font-semibold text-gray-900">Send Report to Patient</h3></div>
             <p className="text-sm text-gray-600 mb-1">This will send the clinical summary to:</p>
             <p className="text-sm font-semibold text-gray-900 mb-5">{patientEmail}</p>
             <div className="flex justify-end gap-3">
-              <button
-                onClick={() => setShowSendConfirm(false)}
-                disabled={sendingReport}
-                className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-600 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
-                style={{ background: '#f3f4f6' }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSendReport}
-                disabled={sendingReport}
-                className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-60"
-                style={{ background: '#2563eb' }}
-              >
-                {sendingReport ? 'Sending…' : 'Confirm & Send'}
-              </button>
+              <button onClick={() => setShowSendConfirm(false)} disabled={sendingReport} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-600 cursor-pointer hover:bg-gray-100 transition-all duration-200 disabled:opacity-50" style={{ background: '#f3f4f6' }}>Cancel</button>
+              <button onClick={handleSendReport} disabled={sendingReport} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 disabled:opacity-60" style={{ background: '#2563eb' }}>{sendingReport ? 'Sending…' : 'Confirm & Send'}</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Override Confirmation Modal */}
       {showOverrideConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
           <div className="w-full max-w-sm mx-4 p-6 rounded-2xl bg-white" style={{ boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}>
-            <div className="flex items-center gap-3 mb-3">
-              <span className="text-2xl">✍️</span>
-              <h3 className="text-lg font-bold text-gray-900">Confirm Override</h3>
-            </div>
+            <div className="flex items-center gap-3 mb-3"><span className="text-2xl">✍️</span><h3 className="text-lg font-bold text-gray-900">Confirm Override</h3></div>
             <p className="text-sm text-gray-500 mb-1">You are about to override the AI result for:</p>
-            <p className="text-sm font-bold text-gray-900 mb-4">
-              {pendingConfirmEye === 'left' ? 'Left Eye' : 'Right Eye'}
-            </p>
+            <p className="text-sm font-bold text-gray-900 mb-4">{pendingConfirmEye === 'left' ? 'Left Eye' : 'Right Eye'}</p>
             <p className="text-xs text-gray-400 mb-5">This will permanently replace the AI result. This action cannot be undone.</p>
             <div className="flex gap-3">
-              <button
-                onClick={() => { setShowOverrideConfirm(false); setPendingConfirmEye(null); }}
-                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
-                style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleOverrideConfirmed}
-                className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
-                style={{ background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' }}
-              >
-                Confirm Override
-              </button>
+              <button onClick={() => { setShowOverrideConfirm(false); setPendingConfirmEye(null); }} className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+              <button onClick={handleOverrideConfirmed} className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200" style={{ background: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)', boxShadow: '0 4px 14px rgba(220,38,38,0.4)' }}>Confirm Override</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Save Report Edits Confirmation Modal */}
       {showSaveReportConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
           <div className="w-full max-w-sm mx-4 p-6 rounded-2xl bg-white" style={{ boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}>
-            <div className="flex items-center gap-3 mb-3">
-              <Pencil size={18} className="text-blue-600" />
-              <h3 className="text-lg font-bold text-gray-900">Save Report Edits?</h3>
-            </div>
-            <p className="text-sm text-gray-600 mb-5">
-              Your changes will update the clinical summary and save it to the database.
-            </p>
+            <div className="flex items-center gap-3 mb-3"><Pencil size={18} className="text-blue-600" /><h3 className="text-lg font-bold text-gray-900">Save Report Edits?</h3></div>
+            <p className="text-sm text-gray-600 mb-5">Your changes will update the clinical summary and save it to the database.</p>
             <div className="flex gap-3">
-              <button
-                onClick={() => setShowSaveReportConfirm(false)}
-                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200"
-                style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveReportEdits}
-                className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200"
-                style={{ background: '#2563eb' }}
-              >
-                Save
-              </button>
+              <button onClick={() => setShowSaveReportConfirm(false)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+              <button onClick={handleSaveReportEdits} className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200" style={{ background: '#2563eb' }}>Save</button>
             </div>
           </div>
         </div>
       )}
-
     </div>
   );
 }
@@ -1158,11 +816,7 @@ function apptStatusColor(status: string): string {
 }
 
 function ApptStatusBadge({ status }: { status: string }) {
-  return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${apptStatusColor(status)}`}>
-      {status.replace('_', ' ')}
-    </span>
-  );
+  return <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${apptStatusColor(status)}`}>{status.replace('_', ' ')}</span>;
 }
 
 function ApptChip({ appt, onClick, className }: { appt: Appointment; onClick: () => void; className?: string }) {
@@ -1170,10 +824,7 @@ function ApptChip({ appt, onClick, className }: { appt: Appointment; onClick: ()
   const h = String(d.getHours()).padStart(2, '0');
   const m = String(d.getMinutes()).padStart(2, '0');
   return (
-    <button
-      onClick={onClick}
-      className={`w-full min-w-0 overflow-hidden text-left text-xs px-1.5 py-0.5 rounded-md mb-0.5 font-medium cursor-pointer hover:brightness-90 transition-all duration-150 ${apptStatusColor(appt.status)} ${className ?? ''}`}
-    >
+    <button onClick={onClick} className={`w-full min-w-0 overflow-hidden text-left text-xs px-1.5 py-0.5 rounded-md mb-0.5 font-medium cursor-pointer hover:brightness-90 transition-all duration-150 ${apptStatusColor(appt.status)} ${className ?? ''}`}>
       <span className="truncate overflow-hidden block">{h}:{m} {appt.patient_name ?? 'Patient'}</span>
     </button>
   );
@@ -1189,20 +840,14 @@ function startOfWeek(d: Date): Date {
 }
 
 function addDays(d: Date, n: number): Date {
-  const r = new Date(d);
-  r.setDate(r.getDate() + n);
-  return r;
+  const r = new Date(d); r.setDate(r.getDate() + n); return r;
 }
 
 function sameDay(a: Date, b: Date): boolean {
-  return a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate();
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
-function apptDate(appt: Appointment): Date {
-  return new Date(appt.appointment_datetime);
-}
+function apptDate(appt: Appointment): Date { return new Date(appt.appointment_datetime); }
 
 function fmtTime(dt: string): string {
   return new Date(dt).toLocaleTimeString('en-MY', { hour: '2-digit', minute: '2-digit', hour12: true });
@@ -1211,7 +856,7 @@ function fmtTime(dt: string): string {
 const WEEK_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
-// ─── Sub-view: Doctor Appointments (read-only) ────────────────────────────────
+// ─── Sub-view: Doctor Appointments ───────────────────────────────────────────
 
 function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
   const [appts, setAppts] = useState<Appointment[]>([]);
@@ -1228,41 +873,31 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
       .finally(() => setLoading(false));
   }, [doctorId]);
 
-  // ── Week calendar ──
   const renderWeek = () => {
     const weekStart = startOfWeek(anchor);
     const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
     const today = new Date();
-    const hours = Array.from({ length: 11 }, (_, i) => i + 8); // 08–18
-
+    const hours = Array.from({ length: 11 }, (_, i) => i + 8);
     return (
       <div className="overflow-x-auto">
         <div style={{ minWidth: 640 }}>
-          {/* Header row: blank time cell + 7 day headers */}
           <div className="flex border-b border-gray-200">
             <div className="w-16 shrink-0" />
             {days.map((d, i) => (
               <div key={i} className={`flex-1 text-center py-2 text-xs font-semibold ${sameDay(d, today) ? 'text-blue-600' : 'text-gray-500'}`}>
                 <div>{WEEK_DAYS[i]}</div>
-                <div className={`text-base font-bold mt-0.5 ${sameDay(d, today) ? 'bg-blue-600 text-white rounded-full w-7 h-7 flex items-center justify-center mx-auto' : ''}`}>
-                  {d.getDate()}
-                </div>
+                <div className={`text-base font-bold mt-0.5 ${sameDay(d, today) ? 'bg-blue-600 text-white rounded-full w-7 h-7 flex items-center justify-center mx-auto' : ''}`}>{d.getDate()}</div>
               </div>
             ))}
           </div>
-          {/* Time rows */}
           {hours.map(h => (
             <div key={h} className="flex border-b border-gray-100">
-              <div className="w-16 shrink-0 text-xs text-gray-400 py-1 pr-2 text-right leading-6">
-                {String(h).padStart(2, '0')}:00
-              </div>
+              <div className="w-16 shrink-0 text-xs text-gray-400 py-1 pr-2 text-right leading-6">{String(h).padStart(2, '0')}:00</div>
               {days.map((d, i) => {
                 const slotAppts = appts.filter(a => sameDay(apptDate(a), d) && new Date(a.appointment_datetime).getHours() === h);
                 return (
                   <div key={i} className="flex-1 overflow-hidden min-w-0 py-0.5 px-0.5 border-l border-gray-100">
-                    {slotAppts.map(a => (
-                      <ApptChip key={a.id} appt={a} onClick={() => setSelectedAppt(a)} />
-                    ))}
+                    {slotAppts.map(a => <ApptChip key={a.id} appt={a} onClick={() => setSelectedAppt(a)} />)}
                   </div>
                 );
               })}
@@ -1273,26 +908,19 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
     );
   };
 
-  // ── Month calendar ──
   const renderMonth = () => {
     const year = anchor.getFullYear();
     const month = anchor.getMonth();
     const firstDay = new Date(year, month, 1);
     const offset = (firstDay.getDay() === 0 ? 6 : firstDay.getDay() - 1);
     const daysInMonth = new Date(year, month + 1, 0).getDate();
-    const cells: (Date | null)[] = [
-      ...Array(offset).fill(null),
-      ...Array.from({ length: daysInMonth }, (_, i) => new Date(year, month, i + 1)),
-    ];
+    const cells: (Date | null)[] = [...Array(offset).fill(null), ...Array.from({ length: daysInMonth }, (_, i) => new Date(year, month, i + 1))];
     while (cells.length % 7 !== 0) cells.push(null);
     const today = new Date();
-
     return (
       <div>
         <div className="grid grid-cols-7 border-b border-gray-200 mb-1">
-          {WEEK_DAYS.map(d => (
-            <div key={d} className="text-center py-1 text-xs font-semibold text-gray-500">{d}</div>
-          ))}
+          {WEEK_DAYS.map(d => <div key={d} className="text-center py-1 text-xs font-semibold text-gray-500">{d}</div>)}
         </div>
         <div className="grid grid-cols-7">
           {cells.map((d, i) => {
@@ -1300,14 +928,7 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
             const isToday = d ? sameDay(d, today) : false;
             return (
               <div key={i} className="min-h-[72px] border border-gray-100 p-1">
-                {d && (
-                  <>
-                    <div className={`text-xs font-semibold mb-0.5 ${isToday ? 'text-blue-600' : 'text-gray-500'}`}>{d.getDate()}</div>
-                    {dayAppts.map(a => (
-                      <ApptChip key={a.id} appt={a} onClick={() => setSelectedAppt(a)} />
-                    ))}
-                  </>
-                )}
+                {d && (<><div className={`text-xs font-semibold mb-0.5 ${isToday ? 'text-blue-600' : 'text-gray-500'}`}>{d.getDate()}</div>{dayAppts.map(a => <ApptChip key={a.id} appt={a} onClick={() => setSelectedAppt(a)} />)}</>)}
               </div>
             );
           })}
@@ -1316,37 +937,26 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
     );
   };
 
-  // ── Day view ──
   const renderDay = () => {
-    const hours = Array.from({ length: 11 }, (_, i) => i + 8); // 08–18
+    const hours = Array.from({ length: 11 }, (_, i) => i + 8);
     const dayAppts = appts.filter(a => sameDay(apptDate(a), anchor));
     const today = new Date();
-
     return (
       <div className="overflow-y-auto" style={{ maxHeight: 520 }}>
         {hours.map(h => {
           const slotAppts = dayAppts.filter(a => new Date(a.appointment_datetime).getHours() === h);
           return (
             <div key={h} className="flex border-b border-gray-100">
-              <div className="w-16 shrink-0 text-xs text-gray-400 py-2 pr-2 text-right">
-                {String(h).padStart(2, '0')}:00
-              </div>
-              <div className="flex-1 overflow-hidden min-w-0 py-1 pl-2">
-                {slotAppts.map(a => (
-                  <ApptChip key={a.id} appt={a} onClick={() => setSelectedAppt(a)} />
-                ))}
-              </div>
+              <div className="w-16 shrink-0 text-xs text-gray-400 py-2 pr-2 text-right">{String(h).padStart(2, '0')}:00</div>
+              <div className="flex-1 overflow-hidden min-w-0 py-1 pl-2">{slotAppts.map(a => <ApptChip key={a.id} appt={a} onClick={() => setSelectedAppt(a)} />)}</div>
             </div>
           );
         })}
-        {dayAppts.length === 0 && (
-          <p className="text-xs text-gray-400 text-center py-8">No appointments on {sameDay(anchor, today) ? 'today' : anchor.toLocaleDateString('en-MY', { weekday: 'long', day: 'numeric', month: 'long' })}.</p>
-        )}
+        {dayAppts.length === 0 && <p className="text-xs text-gray-400 text-center py-8">No appointments on {sameDay(anchor, today) ? 'today' : anchor.toLocaleDateString('en-MY', { weekday: 'long', day: 'numeric', month: 'long' })}.</p>}
       </div>
     );
   };
 
-  // ── Navigation labels ──
   const navLabel = () => {
     if (calMode === 'month') return `${MONTHS[anchor.getMonth()]} ${anchor.getFullYear()}`;
     if (calMode === 'day') return anchor.toLocaleDateString('en-MY', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
@@ -1368,33 +978,21 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
-      <div className="mb-4">
-        <h2 className="text-2xl font-bold text-gray-900">My Schedule</h2>
-      </div>
-
-      {/* Calendar toolbar */}
+      <div className="mb-4"><h2 className="text-2xl font-bold text-gray-900">My Schedule</h2></div>
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-1">
-          <button onClick={navPrev} className="p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"><ChevronLeft size={16} /></button>
-          <button onClick={navNext} className="p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"><ChevronRight size={16} /></button>
+          <button onClick={navPrev} className="p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 cursor-pointer transition-all duration-200"><ChevronLeft size={16} /></button>
+          <button onClick={navNext} className="p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 cursor-pointer transition-all duration-200"><ChevronRight size={16} /></button>
           <span className="text-sm font-semibold text-gray-800 ml-2">{navLabel()}</span>
         </div>
         <div className="flex gap-1">
           {(['month', 'week', 'day'] as const).map(m => (
-            <button
-              key={m}
-              onClick={() => setCalMode(m)}
-              className={`px-3 py-1.5 text-xs font-semibold capitalize cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] ${calMode === m ? 'bg-blue-600 text-white' : 'bg-white text-gray-600'}`}
-              style={{ border: calMode === m ? '1px solid #2563eb' : '1px solid #e5e7eb' }}
-            >{m}</button>
+            <button key={m} onClick={() => setCalMode(m)} className={`px-3 py-1.5 text-xs font-semibold capitalize cursor-pointer hover:brightness-90 transition-all duration-200 ${calMode === m ? 'bg-blue-600 text-white' : 'bg-white text-gray-600'}`} style={{ border: calMode === m ? '1px solid #2563eb' : '1px solid #e5e7eb' }}>{m}</button>
           ))}
         </div>
       </div>
-
       {loading ? (
-        <div className="flex justify-center items-center py-12">
-          <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-        </div>
+        <div className="flex justify-center items-center py-12"><div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" /></div>
       ) : (
         <>
           {calMode === 'week' && renderWeek()}
@@ -1402,21 +1000,15 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
           {calMode === 'day' && renderDay()}
         </>
       )}
-
-      {/* Read-only detail modal */}
       {selectedAppt && (
         <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
           <div className="w-full max-w-md mx-4 p-6 rounded-2xl" style={{ background: '#fff', border: '1px solid #e5e7eb', boxShadow: '0 8px 32px rgba(0,0,0,0.12)' }}>
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-bold text-gray-900">Appointment Details</h3>
-              <button onClick={() => setSelectedAppt(null)} className="p-1 rounded-lg text-gray-400 hover:bg-gray-100 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"><X size={16} /></button>
+              <button onClick={() => setSelectedAppt(null)} className="p-1 rounded-lg text-gray-400 hover:bg-gray-100 cursor-pointer"><X size={16} /></button>
             </div>
-
             <div className="space-y-3 mb-5">
-              <div>
-                <p className="text-xs text-gray-500 mb-0.5">Patient</p>
-                <p className="text-sm font-semibold text-gray-900">{selectedAppt.patient_name ?? '—'}</p>
-              </div>
+              <div><p className="text-xs text-gray-500 mb-0.5">Patient</p><p className="text-sm font-semibold text-gray-900">{selectedAppt.patient_name ?? '—'}</p></div>
               <div>
                 <p className="text-xs text-gray-500 mb-0.5">Date & Time</p>
                 <p className="text-sm font-semibold text-gray-900">
@@ -1424,29 +1016,11 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
                   {' at '}{fmtTime(selectedAppt.appointment_datetime)}
                 </p>
               </div>
-              <div>
-                <p className="text-xs text-gray-500 mb-0.5">Status</p>
-                <ApptStatusBadge status={selectedAppt.status} />
-              </div>
-              {selectedAppt.notes && (
-                <div>
-                  <p className="text-xs text-gray-500 mb-0.5">Notes</p>
-                  <p className="text-sm text-gray-700">{selectedAppt.notes}</p>
-                </div>
-              )}
+              <div><p className="text-xs text-gray-500 mb-0.5">Status</p><ApptStatusBadge status={selectedAppt.status} /></div>
+              {selectedAppt.notes && <div><p className="text-xs text-gray-500 mb-0.5">Notes</p><p className="text-sm text-gray-700">{selectedAppt.notes}</p></div>}
             </div>
-
-            <div className="px-4 py-3 rounded-xl text-xs text-gray-500" style={{ background: '#f9fafb', border: '1px solid #e5e7eb' }}>
-              Contact the nurse to make changes to this appointment.
-            </div>
-
-            <button
-              onClick={() => setSelectedAppt(null)}
-              className="mt-4 w-full py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-              style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
-            >
-              Close
-            </button>
+            <div className="px-4 py-3 rounded-xl text-xs text-gray-500" style={{ background: '#f9fafb', border: '1px solid #e5e7eb' }}>Contact the nurse to make changes to this appointment.</div>
+            <button onClick={() => setSelectedAppt(null)} className="mt-4 w-full py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Close</button>
           </div>
         </div>
       )}
@@ -1472,11 +1046,11 @@ export default function DoctorDashboard() {
     screeningsAPI.getAssignedToDoctor(user.user_id)
       .then(r => setAssignedSessions(r.data ?? []))
       .catch(() => {});
-  }, [user, view.name]); // Reload sidebar when navigating back to inbox
+  }, [user, view.name]);
 
   const filtered = sidebarQuery
     ? assignedSessions.filter(s => {
-        const name = ((s as unknown as Record<string, unknown>).patient_name as string ?? s.patient?.name ?? '').toLowerCase();
+        const name = extractPatientName(s).toLowerCase();
         return name.includes(sidebarQuery.toLowerCase()) || s.status.includes(sidebarQuery.toLowerCase());
       })
     : assignedSessions;
@@ -1488,14 +1062,8 @@ export default function DoctorDashboard() {
     const startX = e.clientX;
     const startWidth = sidebarWidth;
     setIsDragging(true);
-    const onMouseMove = (ev: MouseEvent) => {
-      setSidebarWidth(Math.min(500, Math.max(200, startWidth + (ev.clientX - startX))));
-    };
-    const onMouseUp = () => {
-      setIsDragging(false);
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-    };
+    const onMouseMove = (ev: MouseEvent) => { setSidebarWidth(Math.min(500, Math.max(200, startWidth + (ev.clientX - startX)))); };
+    const onMouseUp = () => { setIsDragging(false); window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp); };
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
   };
@@ -1503,17 +1071,7 @@ export default function DoctorDashboard() {
   return (
     <div className="flex h-screen overflow-hidden" style={{ background: '#f9fafb', fontFamily: 'Inter, system-ui, sans-serif' }}>
       {/* Sidebar */}
-      <div
-        className="flex flex-col shrink-0 h-screen overflow-hidden"
-        style={{
-          width: isSidebarOpen ? sidebarWidth : 0,
-          minWidth: 0,
-          background: '#fff',
-          borderRight: '1px solid #e5e7eb',
-          transition: isDragging ? 'none' : 'width 300ms ease',
-          position: 'relative',
-        }}
-      >
+      <div className="flex flex-col shrink-0 h-screen overflow-hidden" style={{ width: isSidebarOpen ? sidebarWidth : 0, minWidth: 0, background: '#fff', borderRight: '1px solid #e5e7eb', transition: isDragging ? 'none' : 'width 300ms ease', position: 'relative' }}>
         {/* User info */}
         <div className="px-4 py-4 shrink-0" style={{ borderBottom: '1px solid #e5e7eb' }}>
           <div className="flex items-center gap-3">
@@ -1523,24 +1081,14 @@ export default function DoctorDashboard() {
               <p className="text-xs truncate text-gray-500">{user?.email}</p>
               <span className="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-bold" style={{ background: '#dbeafe', border: '1px solid #93c5fd', color: '#1d4ed8' }}>Doctor</span>
             </div>
-            <button
-              onClick={() => setIsSidebarOpen(false)}
-              className="shrink-0 p-1 rounded-lg text-gray-400 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-              title="Close sidebar"
-            >
-              <ChevronLeft size={16} />
-            </button>
+            <button onClick={() => setIsSidebarOpen(false)} className="shrink-0 p-1 rounded-lg text-gray-400 cursor-pointer hover:bg-gray-100 transition-all duration-200" title="Close sidebar"><ChevronLeft size={16} /></button>
           </div>
         </div>
 
         {/* My Schedule nav */}
         <div className="px-3 pt-3 pb-1">
-          <button
-            onClick={() => setView({ name: 'appointments' })}
-            className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-all duration-200 mb-2 cursor-pointer hover:brightness-110 hover:scale-[1.02] active:scale-[0.98] ${view.name === 'appointments' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}
-          >
-            <CalendarDays size={15} className="shrink-0" />
-            My Schedule
+          <button onClick={() => setView({ name: 'appointments' })} className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-all duration-200 mb-2 cursor-pointer hover:brightness-110 hover:scale-[1.02] active:scale-[0.98] ${view.name === 'appointments' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}>
+            <CalendarDays size={15} className="shrink-0" /> My Schedule
           </button>
         </div>
 
@@ -1549,13 +1097,7 @@ export default function DoctorDashboard() {
           <p className="text-xs font-bold uppercase tracking-widest mb-2 text-gray-400">Assigned Sessions</p>
           <div className="relative mb-1">
             <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
-            <input
-              className="w-full pl-7 pr-2 py-1.5 rounded-xl text-xs outline-none"
-              style={inputStyle}
-              placeholder="Search patient…"
-              value={sidebarQuery}
-              onChange={e => setSidebarQuery(e.target.value)}
-            />
+            <input className="w-full pl-7 pr-2 py-1.5 rounded-xl text-xs outline-none" style={inputStyle} placeholder="Search patient…" value={sidebarQuery} onChange={e => setSidebarQuery(e.target.value)} />
           </div>
           <p className="text-xs mb-2 text-gray-400">Quick open any case</p>
         </div>
@@ -1564,7 +1106,7 @@ export default function DoctorDashboard() {
         <div className="flex-1 overflow-y-auto px-3 pb-2">
           {filtered.map(s => {
             const raw = s as unknown as Record<string, unknown>;
-            const patientName = raw.patient_name as string ?? s.patient?.name ?? 'Unknown';
+            const patientName = extractPatientName(s);
             const sessionNo = raw.session_number as number ?? '-';
             const isFinalized = ['approved', 'overridden'].includes(s.status?.toLowerCase());
             return (
@@ -1582,89 +1124,37 @@ export default function DoctorDashboard() {
               </div>
             );
           })}
-          {filtered.length === 0 && (
-            <p className="text-xs px-1 text-gray-400">No assigned sessions found.</p>
-          )}
+          {filtered.length === 0 && <p className="text-xs px-1 text-gray-400">No assigned sessions found.</p>}
         </div>
 
         <hr style={{ borderColor: '#e5e7eb' }} />
-
-        {/* Sign out */}
         <div className="p-3">
-          <button
-            onClick={handleLogout}
-            className="w-full flex items-center justify-center gap-2 py-2 rounded-xl text-sm font-bold cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-            style={{ background: '#fee2e2', border: '1px solid #fca5a5', color: '#dc2626' }}
-          >
+          <button onClick={handleLogout} className="w-full flex items-center justify-center gap-2 py-2 rounded-xl text-sm font-bold cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#fee2e2', border: '1px solid #fca5a5', color: '#dc2626' }}>
             <LogOut size={14} /> Sign Out
           </button>
         </div>
 
-        {/* Drag handle — grab right edge to resize sidebar */}
-        <div
-          onMouseDown={handleSidebarDragStart}
-          style={{
-            position: 'absolute',
-            top: 0,
-            right: 0,
-            width: 6,
-            height: '100%',
-            cursor: 'col-resize',
-            zIndex: 20,
-          }}
-          onMouseEnter={e => (e.currentTarget.style.background = 'rgba(59,130,246,0.25)')}
-          onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-        />
+        <div onMouseDown={handleSidebarDragStart} style={{ position: 'absolute', top: 0, right: 0, width: 6, height: '100%', cursor: 'col-resize', zIndex: 20 }} onMouseEnter={e => (e.currentTarget.style.background = 'rgba(59,130,246,0.25)')} onMouseLeave={e => (e.currentTarget.style.background = 'transparent')} />
       </div>
 
-      {/* Right-side wrapper: header + scrollable content column */}
+      {/* Main content */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
-        {/* Top bar */}
-        <header
-          className="flex-none flex items-center px-3 py-2 border-b border-gray-200"
-          style={{ background: '#fff' }}
-        >
-          <button
-            onClick={() => setIsSidebarOpen(v => !v)}
-            className="p-1.5 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-            style={{ background: '#f3f4f6' }}
-            title="Toggle sidebar"
-          >
-            <Menu size={16} />
-          </button>
+        <header className="flex-none flex items-center px-3 py-2 border-b border-gray-200" style={{ background: '#fff' }}>
+          <button onClick={() => setIsSidebarOpen(v => !v)} className="p-1.5 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200" style={{ background: '#f3f4f6' }} title="Toggle sidebar"><Menu size={16} /></button>
           {(view.name === 'review' || view.name === 'appointments') && (
-            <>
-              <button
-                onClick={() => setView({ name: 'inbox' })}
-                className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-              >
-                ← Back to Inbox
-              </button>
-            </>
+            <button onClick={() => setView({ name: 'inbox' })} className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200">← Back to Inbox</button>
           )}
         </header>
         <main className="flex-1 overflow-y-auto min-w-0">
-        {view.name === 'inbox' && user && (
-          <InboxView
-            user={user}
-            onOpen={s => {
-              const patientName = (s as unknown as Record<string, unknown>).patient_name as string ?? s.patient?.name ?? 'Unknown';
-              setView({ name: 'review', sessionId: s.id, patientName });
-            }}
-          />
-        )}
-        {view.name === 'review' && user && (
-          <ReviewView
-            sessionId={view.sessionId}
-            patientName={view.patientName}
-            onBack={() => setView({ name: 'inbox' })}
-            user={user}
-            refreshKey={reviewRefreshKey}
-          />
-        )}
-        {view.name === 'appointments' && user && (
-          <DoctorAppointmentsView doctorId={user.user_id} />
-        )}
+          {view.name === 'inbox' && user && (
+            <InboxView user={user} onOpen={s => { const patientName = extractPatientName(s); setView({ name: 'review', sessionId: s.id, patientName }); }} />
+          )}
+          {view.name === 'review' && user && (
+            <ReviewView sessionId={view.sessionId} patientName={view.patientName} onBack={() => setView({ name: 'inbox' })} user={user} refreshKey={reviewRefreshKey} />
+          )}
+          {view.name === 'appointments' && user && (
+            <DoctorAppointmentsView doctorId={user.user_id} />
+          )}
         </main>
       </div>
     </div>
