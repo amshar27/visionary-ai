@@ -3,6 +3,7 @@ import torch.nn as nn
 import io
 import math
 import requests
+import re
 from PIL import Image
 from torchvision import models, transforms
 from torchvision.models import ResNet152_Weights
@@ -75,6 +76,25 @@ DISEASE_SEVERITY_MAP = {
     'Cataract': 'cataract',
     'Glaucoma': 'glaucoma'
 }
+
+# Standardized template returned when the CNN predicts No DR for both eyes.
+# Bypasses the RAG pipeline since "management guidelines for absence of disease"
+# is not a meaningful retrieval query.
+NORMAL_SCREENING_TEMPLATE = """### Routine Screening Result
+
+The AI screening did not detect signs of diabetic retinopathy, cataract, or glaucoma in either eye.
+
+**Diagnostic Summary**
+Both eyes screened as **No DR**. No referable findings detected.
+
+**Recommended Management**
+- No specialist referral indicated at this time.
+- Continue routine annual diabetic eye screening per Malaysian Clinical Practice Guidelines (12-month follow-up interval).
+- Advise the patient to report any new visual symptoms (blurring, floaters, sudden vision loss) promptly.
+
+**Disclaimer**
+This is an AI-assisted screening result. Clinical correlation by an attending ophthalmologist is recommended for final assessment.
+"""
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f"Using device: {device}")
@@ -550,6 +570,39 @@ async def update_rag_summary(session_id: str, payload: dict):
     return {"ok": True, "message": "RAG summary updated"}
 
 
+FRONT_MATTER_PATTERNS = [
+    r"statement of intent",
+    r"table of contents",
+    r"list of (tables|figures|abbreviations|contributors)",
+    r"^\s*references\s*$",
+    r"levels? of evidence",
+    r"grades? of recommendation",
+    r"acknowledge?ments?",
+    r"expert panel",
+    r"^\s*copyright",
+    r"disclaimer",
+    r"foreword",
+    r"preface",
+    r"abbreviations? and acronyms",
+]
+
+
+def is_front_matter(page_text: str) -> bool:
+    """
+    Detect boilerplate / front-matter pages that should be skipped
+    during ingestion. Returns True if the page should be skipped.
+
+    Logic:
+      - Pages shorter than 200 chars (title pages, blanks) → skipped
+      - Pages matching 2+ boilerplate patterns → skipped
+    """
+    text = page_text.lower().strip()
+    if len(text) < 200:
+        return True
+    hits = sum(1 for pattern in FRONT_MATTER_PATTERNS if re.search(pattern, text))
+    return hits >= 2
+
+
 @router.post("/ingest-research")
 def ingest_research_papers(bucket_name: str = "guidelines"):
     try:
@@ -558,6 +611,7 @@ def ingest_research_papers(bucket_name: str = "guidelines"):
             return {"message": "No files found in storage bucket"}
 
         documents = []
+        ingestion_stats = []
 
         for file in files:
             file_name = file['name']
@@ -575,23 +629,67 @@ def ingest_research_papers(bucket_name: str = "guidelines"):
             loader = PyPDFLoader(tmp_path)
             raw_docs = loader.load()
 
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200
-            )
-            docs = text_splitter.split_documents(raw_docs)
+            # --- Change 1: filter out front-matter pages ---
+            total_pages = len(raw_docs)
+            filtered_docs = []
+            skipped_pages = []
 
+            for page_doc in raw_docs:
+                page_num = page_doc.metadata.get("page", -1)
+                if is_front_matter(page_doc.page_content):
+                    skipped_pages.append(page_num)
+                else:
+                    filtered_docs.append(page_doc)
+
+            logger.info(
+                f"  {file_name}: kept {len(filtered_docs)}/{total_pages} pages "
+                f"(skipped front-matter pages: {skipped_pages})"
+            )
+
+            # --- Change 2: larger, section-aware chunks ---
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=2000,
+                chunk_overlap=300,
+                separators=["\n## ", "\n### ", "\n#### ", "\n\n", "\n", ". ", " ", ""],
+            )
+            docs = text_splitter.split_documents(filtered_docs)
+
+            # --- Change 3: tag chunks with source metadata ---
             for doc in docs:
                 doc.metadata["source"] = file_name
+                # page number from PyPDFLoader is preserved automatically
 
             documents.extend(docs)
+            ingestion_stats.append({
+                "file": file_name,
+                "total_pages": total_pages,
+                "kept_pages": len(filtered_docs),
+                "skipped_pages": skipped_pages,
+                "chunks_produced": len(docs),
+            })
+
             os.remove(tmp_path)
 
         if documents:
-            vector_store.add_documents(documents)
-            return {"message": f"Successfully ingested {len(documents)} chunks from {len(files)} files."}
+            # Batch embeddings to stay under OpenAI's 300k tokens-per-request limit.
+            # text-embedding-3-small averages ~250-400 tokens per 2000-char chunk,
+            # so 100 chunks per batch keeps us comfortably under the cap.
+            BATCH_SIZE = 100
+            total = len(documents)
+            for i in range(0, total, BATCH_SIZE):
+                batch = documents[i:i + BATCH_SIZE]
+                logger.info(
+                    f"Embedding batch {i // BATCH_SIZE + 1}/{(total + BATCH_SIZE - 1) // BATCH_SIZE} "
+                    f"({len(batch)} chunks, {i + len(batch)}/{total} total)"
+                )
+                vector_store.add_documents(batch)
 
-        return {"message": "No documents processed"}
+            return {
+                "message": f"Successfully ingested {total} chunks from {len(ingestion_stats)} files.",
+                "stats": ingestion_stats,
+            }
+
+        return {"message": "No documents processed", "stats": ingestion_stats}
 
     except Exception as e:
         logger.error(f"Ingestion failed: {e}")
@@ -599,8 +697,37 @@ def ingest_research_papers(bucket_name: str = "guidelines"):
 
 
 # ======================================================
-# RAG: GENERATION ENDPOINT
+# RAG: REPORT GENERATION (CrewAI multi-agent)
 # ======================================================
+def _is_no_dr_session(ai_results_data: list) -> bool:
+    """
+    Returns True if all eyes in the session were classified as 'No DR' / 'none'
+    and no doctor override has set a non-none severity_label.
+    """
+    if not ai_results_data:
+        return False
+
+    severity_levels = {'none': 0, 'mild': 1, 'moderate': 2, 'severe': 3, 'proliferative': 4}
+
+    for result in ai_results_data:
+        # Defensive read — handles doctor-overridden rows where dr_severity is null
+        severity = (result.get('dr_severity') or result.get('severity_label') or 'none').lower()
+
+        # Any disease (DR severity, cataract, or glaucoma) → not a No DR session
+        if severity in ('cataract', 'glaucoma'):
+            return False
+        if severity_levels.get(severity, 0) > 0:
+            return False
+
+    return True
+
+
+# ----------------------------------------------------------------------
+# DISABLED — original single-pipeline RAG endpoint.
+# Superseded by /summarise-rag-crew (CrewAI multi-agent version).
+# Kept here for reference and possible future comparison.
+# ----------------------------------------------------------------------
+'''
 @router.post("/summarise-rag")
 def generate_rag_summary(screening_session_id: UUID):
     try:
@@ -704,6 +831,21 @@ def generate_rag_summary(screening_session_id: UUID):
 
         if not ai_res.data:
             raise HTTPException(status_code=404, detail="No AI analysis found. Run /analyze first.")
+
+        # --- NO DR BYPASS ---
+        # Healthy screenings skip the RAG pipeline and return a fixed template.
+        if _is_no_dr_session(ai_res.data):
+            logger.info(f"No DR bypass triggered for session {screening_session_id}")
+            try:
+                supabase.table("ai_results").update(
+                    {"rag_summary": NORMAL_SCREENING_TEMPLATE}
+                ).eq("screening_session_id", str(screening_session_id)).execute()
+            except Exception as save_err:
+                logger.warning(f"Failed to persist No DR template: {save_err}")
+            return {
+                "rag_summary": NORMAL_SCREENING_TEMPLATE,
+                "references": []
+            }
 
         severity_levels = {'none': 0, 'mild': 1, 'moderate': 2, 'severe': 3, 'proliferative': 4}
         worst_severity_score = -1
@@ -849,11 +991,9 @@ Guideline text:
             "rag_summary": f"**Error generating report:** {str(e)}\n\nPlease review raw results manually.",
             "references": []
         }
+'''
 
 
-# ======================================================
-# RAG: MULTI-AGENT VERSION (CrewAI)
-# ======================================================
 @router.post("/summarise-rag-crew")
 def generate_rag_summary_crew(screening_session_id: UUID):
     """
@@ -861,8 +1001,30 @@ def generate_rag_summary_crew(screening_session_id: UUID):
     Same input/output contract as /summarise-rag.
     """
     import re
-    
+
     try:
+        # --- NO DR BYPASS ---
+        # Healthy screenings skip the RAG pipeline (and CrewAI) entirely
+        # and return a fixed normal-screening template.
+        ai_res = (
+            supabase.table("ai_results")
+            .select("*")
+            .eq("screening_session_id", str(screening_session_id))
+            .execute()
+        )
+        if ai_res.data and _is_no_dr_session(ai_res.data):
+            logger.info(f"No DR bypass triggered for session {screening_session_id} (crew endpoint)")
+            try:
+                supabase.table("ai_results").update(
+                    {"rag_summary": NORMAL_SCREENING_TEMPLATE}
+                ).eq("screening_session_id", str(screening_session_id)).execute()
+            except Exception as save_err:
+                logger.warning(f"Failed to persist No DR template: {save_err}")
+            return {
+                "rag_summary": NORMAL_SCREENING_TEMPLATE,
+                "references": []
+            }
+
         from backend.agents.crew import run_clinical_report_crew
         import json
 
