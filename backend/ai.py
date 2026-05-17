@@ -1026,26 +1026,31 @@ def generate_rag_summary_crew(screening_session_id: UUID):
             }
 
         from backend.agents.crew import run_clinical_report_crew
-        import json
 
         result = run_clinical_report_crew(str(screening_session_id))
 
         raw = result.raw if hasattr(result, "raw") else str(result)
 
-        # The agent sometimes wraps its JSON output in ```json ... ``` fences,
-        # which makes json.loads fail. Strip the fences before parsing.
+        # Defensive cleanup: the Writer agent's contract is plain markdown,
+        # but agents occasionally wrap output in code fences or prefix with
+        # "Final Answer:" despite explicit instructions otherwise.
         cleaned = raw.strip()
-        cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```$", "", cleaned)
+        cleaned = re.sub(r"^```(?:markdown|md)?\s*\n?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+        cleaned = re.sub(r"^(final answer|answer)\s*:\s*\n?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
 
+        # Derive references by scanning the report itself for .pdf mentions.
+        # The Researcher's brief feeds source filenames into the Writer's
+        # context, so they typically surface in the Recommended Management
+        # section or inline citations.
+        references = []
         try:
-            parsed = json.loads(cleaned)
-            return {
-                "rag_summary": parsed.get("rag_summary", cleaned),
-                "references": parsed.get("references", []),
-            }
-        except json.JSONDecodeError:
-            return {"rag_summary": cleaned, "references": []}
+            references = sorted(set(re.findall(r"[\w\-\.]+\.pdf", cleaned)))
+        except Exception:
+            pass
+
+        return {"rag_summary": cleaned, "references": references}
 
     except Exception as e:
         logger.error(f"Crew RAG generation failed: {e}")
@@ -1072,9 +1077,26 @@ def evaluate_rag(screening_session_id: UUID):
         from ragas.llms import LangchainLLMWrapper
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from langchain_openai import ChatOpenAI as LCChatOpenAI
-        from ragas.metrics import faithfulness, answer_relevancy, context_precision
+        from ragas.metrics import faithfulness, answer_relevancy
         from datasets import Dataset as _Dataset
-        _ragas_metrics = [faithfulness, answer_relevancy, context_precision]
+        # context_precision requires a 'reference' ground-truth column we don't have.
+        # ContextUtilization is the reference-free equivalent in RAGAS 0.2.x.
+        # Try fallback chain so older/newer RAGAS versions still work.
+        try:
+            from ragas.metrics import ContextUtilization
+            _context_metric = ContextUtilization()
+            _context_metric_name = "context_utilization"
+        except ImportError:
+            try:
+                from ragas.metrics import ContextRelevance
+                _context_metric = ContextRelevance()
+                _context_metric_name = "context_relevance"
+            except ImportError:
+                from ragas.metrics import context_precision
+                _context_metric = context_precision
+                _context_metric_name = "context_precision"
+
+        _ragas_metrics = [faithfulness, answer_relevancy, _context_metric]
         _ragas_llm = LangchainLLMWrapper(LCChatOpenAI(model="gpt-4o-mini", max_tokens=4000))
         _ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
         _ragas_loaded = True

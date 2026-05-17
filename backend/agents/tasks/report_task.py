@@ -33,16 +33,17 @@ def build_report_task(screening_session_id: str, research_task) -> Task:
             f"   - Disclaimer: this is AI-assisted, not a diagnosis\n"
             f"6. Use report_persist to save the final markdown to ai_results "
             f"(pass screening_session_id={screening_session_id} and the full "
-            f"markdown report as rag_summary).\n\n"
-            f"Critical: for eyes marked *(doctor-confirmed)* in the diagnostic "
-            f"data, do NOT mention any confidence percentage. Refer to them as "
-            f"the doctor's confirmed diagnosis."
+            f"markdown report as rag_summary).\n"
+            f"7. After persisting, return ONLY the markdown report itself as "
+            f"your final answer — no JSON wrapping, no code fences, no tool "
+            f"output messages.\n\n"
         ),
         expected_output=(
-            "A complete six-section markdown clinical report saved to the database. "
-            "Return the markdown string and the list of source filenames from the "
-            "Researcher's brief as a JSON object: "
-            "{\"rag_summary\": \"...\", \"references\": [\"...\"]}"
+            "The complete six-section markdown clinical report, exactly as it "
+            "was passed to report_persist. Start your answer with '### Clinical "
+            "Summary for' and end with the disclaimer paragraph. Output ONLY "
+            "the markdown — no JSON, no code fences, no commentary, no tool "
+            "call summaries, no 'Final Answer:' prefix, nothing else."
         ),
         agent=writer,
         context=[research_task],
