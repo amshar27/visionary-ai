@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, RefreshCw, LogOut, Search, Upload, Brain, UserCheck, Menu, ChevronLeft, ChevronRight, Users, CalendarDays, CalendarPlus, X } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -6,6 +6,10 @@ import { useAuth } from '../context/AuthContext';
 import { patientsAPI, screeningsAPI, uploadsAPI, aiAPI, staffAPI, appointmentsAPI } from '../services/api';
 import { formatDt, getEyeSide, fmtConfidence } from '../utils/format';
 import type { Patient, ScreeningSession, RetinalImage, AIResult, StaffUser, Appointment } from '../types';
+import Pagination from '../components/Pagination';
+import AppHeader from '../components/AppHeader';
+
+const PAGE_SIZE = 15;
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
 
@@ -148,7 +152,8 @@ type NurseView =
   | { name: 'new-patient' }
   | { name: 'workspace'; patient: Patient }
   | { name: 'session'; patient: Patient; sessionId: string }
-  | { name: 'appointments' };
+  | { name: 'appointments' }
+  | { name: 'all-patients' };
 
 // ─── Sub-view: New Patient ────────────────────────────────────────────────────
 
@@ -417,6 +422,8 @@ function WorkspaceView({
   const { user } = useAuth();
   const [sessions, setSessions] = useState<ScreeningSession[]>([]);
   const [creating, setCreating] = useState(false);
+  const [page, setPage] = useState(1);
+  const tableRef = useRef<HTMLDivElement | null>(null);
 
   const loadSessions = () => {
     screeningsAPI.getByPatient(patient.id)
@@ -424,7 +431,14 @@ function WorkspaceView({
       .catch(() => toast.error('Failed to load sessions.'));
   };
 
-  useEffect(() => { loadSessions(); }, [patient.id]);
+  useEffect(() => { loadSessions(); setPage(1); }, [patient.id]);
+
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(sessions.length / PAGE_SIZE));
+    if (page > totalPages) setPage(1);
+  }, [sessions.length, page]);
+
+  const paginatedSessions = sessions.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   const handleNewSession = async () => {
     setCreating(true);
@@ -468,26 +482,35 @@ function WorkspaceView({
       {sessions.length === 0 ? (
         <p className="text-sm text-gray-500">No screening sessions yet. Start one with the button above.</p>
       ) : (
-        <div className="space-y-2">
-          {sessions.map(s => {
-            const sessionNo = (s as unknown as Record<string, unknown>).session_number as number ?? '-';
-            const sessionDate = (s as unknown as Record<string, unknown>).session_date as string ?? s.created_at;
-            return (
-              <div key={s.id} style={cardStyle} className="flex items-center justify-between gap-4">
-                <div>
-                  <p className="font-semibold text-gray-900 text-sm">Session #{String(sessionNo)}</p>
-                  <p className="text-xs mt-0.5 text-gray-500">{formatDt(sessionDate)}</p>
+        <div ref={tableRef}>
+          <div className="space-y-2">
+            {paginatedSessions.map(s => {
+              const sessionNo = (s as unknown as Record<string, unknown>).session_number as number ?? '-';
+              const sessionDate = (s as unknown as Record<string, unknown>).session_date as string ?? s.created_at;
+              return (
+                <div key={s.id} style={cardStyle} className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="font-semibold text-gray-900 text-sm">Session #{String(sessionNo)}</p>
+                    <p className="text-xs mt-0.5 text-gray-500">{formatDt(sessionDate)}</p>
+                  </div>
+                  <StatusBadge status={s.status} />
+                  <button
+                    onClick={() => onSelectSession(s.id)}
+                    className="px-4 py-1.5 rounded-xl text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+                  >
+                    Select
+                  </button>
                 </div>
-                <StatusBadge status={s.status} />
-                <button
-                  onClick={() => onSelectSession(s.id)}
-                  className="px-4 py-1.5 rounded-xl text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-                >
-                  Select
-                </button>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
+          <Pagination
+            totalItems={sessions.length}
+            itemsPerPage={PAGE_SIZE}
+            currentPage={page}
+            onPageChange={setPage}
+            scrollTargetRef={tableRef}
+          />
         </div>
       )}
     </div>
@@ -1437,6 +1460,93 @@ function AppointmentsView({ currentUserId }: AppointmentsViewProps) {
   );
 }
 
+// ─── Sub-view: All Patients (Nurse) ──────────────────────────────────────────
+
+function AllPatientsNurseView({
+  patients,
+  onSelectPatient,
+}: {
+  patients: Patient[];
+  onSelectPatient: (p: Patient) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [page, setPage] = useState(1);
+  const tableRef = useRef<HTMLDivElement | null>(null);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return patients;
+    return patients.filter(p =>
+      p.name.toLowerCase().includes(q) ||
+      (p.ic_passport ?? '').toLowerCase().includes(q)
+    );
+  }, [patients, query]);
+
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    if (page > totalPages) setPage(1);
+  }, [filtered.length, page]);
+
+  const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  return (
+    <div className="p-6 max-w-5xl mx-auto">
+      <h2 className="text-2xl font-bold text-gray-900 mb-1">All Patients</h2>
+      <p className="text-sm mb-4 text-gray-500">All registered patients in the system.</p>
+
+      <div className="relative mb-4">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+        <input
+          value={query}
+          onChange={e => { setQuery(e.target.value); setPage(1); }}
+          placeholder="Search patient by name or IC..."
+          className="w-full pl-9 pr-3 py-2 rounded-xl text-sm outline-none"
+          style={inputStyle}
+        />
+      </div>
+
+      <hr style={{ borderColor: '#e5e7eb', marginBottom: 12 }} />
+
+      {patients.length === 0 ? (
+        <p className="text-sm text-gray-500">No patients yet.</p>
+      ) : filtered.length === 0 ? (
+        <p className="text-sm text-gray-500">No patients match your search.</p>
+      ) : (
+        <div ref={tableRef}>
+          <p className="text-xs mb-3 text-gray-400">
+            {filtered.length > PAGE_SIZE
+              ? `Showing ${paginated.length} of ${filtered.length} patient(s).`
+              : `Showing ${filtered.length} patient(s).`}
+          </p>
+          <div className="grid text-xs font-bold uppercase tracking-wide pb-2 mb-1 text-gray-400" style={{ gridTemplateColumns: '2fr 1.5fr 100px', borderBottom: '1px solid #e5e7eb' }}>
+            <span>Name</span><span>IC / Passport</span><span className="text-right">Sessions</span>
+          </div>
+          {paginated.map(p => (
+            <div key={p.id} className="grid items-center py-3" style={{ gridTemplateColumns: '2fr 1.5fr 100px', borderBottom: '1px solid #f3f4f6' }}>
+              <button
+                onClick={() => onSelectPatient(p)}
+                className="text-left text-sm font-semibold text-blue-600 hover:text-blue-800 hover:underline cursor-pointer"
+              >
+                {p.name}
+              </button>
+              <span className="text-sm text-gray-600">{p.ic_passport || '—'}</span>
+              {/* TODO: requires session count endpoint */}
+              <span className="text-sm text-gray-400 text-right tabular-nums">—</span>
+            </div>
+          ))}
+          <Pagination
+            totalItems={filtered.length}
+            itemsPerPage={PAGE_SIZE}
+            currentPage={page}
+            onPageChange={setPage}
+            scrollTargetRef={tableRef}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main: Nurse Dashboard ────────────────────────────────────────────────────
 
 export default function NurseDashboard() {
@@ -1447,19 +1557,40 @@ export default function NurseDashboard() {
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [isDragging, setIsDragging] = useState(false);
   const [sidebarQuery, setSidebarQuery] = useState('');
-  const [sidebarPatients, setSidebarPatients] = useState<Patient[]>([]);
+  const [allPatients, setAllPatients] = useState<Patient[]>([]);
   const [patientListKey, setPatientListKey] = useState(0);
+  const [returnTo, setReturnTo] = useState<'home' | 'all-patients'>('home');
 
   useEffect(() => {
-    const t = setTimeout(() => {
-      patientsAPI.search(sidebarQuery.trim() || undefined, 30)
-        .then(r => setSidebarPatients(r.data ?? []))
-        .catch(() => {});
-    }, 350);
-    return () => clearTimeout(t);
-  }, [sidebarQuery, patientListKey]);
+    patientsAPI.search(undefined, 200)
+      .then(r => setAllPatients(r.data ?? []))
+      .catch(() => {});
+  }, [patientListKey]);
+
+  const sortedPatients = useMemo(
+    () => [...allPatients].sort((a, b) => {
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
+    }),
+    [allPatients]
+  );
+
+  const topPatients = useMemo(() => sortedPatients.slice(0, 5), [sortedPatients]);
+
+  const sidebarDisplayPatients = sidebarQuery.trim()
+    ? sortedPatients.filter(p => {
+        const q = sidebarQuery.trim().toLowerCase();
+        return p.name.toLowerCase().includes(q) || (p.ic_passport ?? '').toLowerCase().includes(q);
+      })
+    : topPatients;
 
   const handleLogout = () => { logout(); navigate('/login', { replace: true }); };
+
+  const handleLogoClick = () => {
+    setReturnTo('home');
+    setView({ name: 'home' });
+  };
 
   const handleSidebarDragStart = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -1555,10 +1686,16 @@ export default function NurseDashboard() {
 
         {/* Patient list */}
         <div className="flex-1 overflow-y-auto px-3 pb-2">
-          {sidebarPatients.map(p => (
+          {sortedPatients.length === 0 && (
+            <p className="text-xs px-1 text-gray-400">No patients yet.</p>
+          )}
+          {sortedPatients.length > 0 && sidebarDisplayPatients.length === 0 && (
+            <p className="text-xs px-1 text-gray-400">No patients match your search.</p>
+          )}
+          {sidebarDisplayPatients.map(p => (
             <div key={p.id} className="mb-1">
               <button
-                onClick={() => setView({ name: 'workspace', patient: p })}
+                onClick={() => { setReturnTo('home'); setView({ name: 'workspace', patient: p }); }}
                 className="w-full text-left px-3 py-2 rounded-xl text-sm text-gray-900 cursor-pointer"
                 style={{ background: '#f9fafb' }}
                 onMouseEnter={e => (e.currentTarget.style.background = '#f3f4f6')}
@@ -1568,6 +1705,14 @@ export default function NurseDashboard() {
               </button>
             </div>
           ))}
+          {sortedPatients.length > 0 && (
+            <button
+              onClick={() => setView({ name: 'all-patients' })}
+              className="block w-full text-left px-3 py-2 mt-1 text-sm text-blue-600 hover:text-blue-800 hover:underline cursor-pointer"
+            >
+              See more patients →
+            </button>
+          )}
         </div>
 
         <hr style={{ borderColor: '#e5e7eb' }} />
@@ -1604,37 +1749,39 @@ export default function NurseDashboard() {
       {/* Right-side wrapper: header + scrollable content column */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
         {/* Top bar */}
-        <header
-          className="flex-none flex items-center px-3 py-2 border-b border-gray-200"
-          style={{ background: '#fff' }}
-        >
-          {view.name !== 'new-patient' && (
-            <button
-              onClick={() => setIsSidebarOpen(v => !v)}
-              className="p-1.5 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 hover:opacity-70 transition-all duration-150"
-              style={{ background: '#f3f4f6' }}
-              title="Toggle sidebar"
-            >
-              <Menu size={16} />
-            </button>
-          )}
-          {(view.name === 'workspace' || view.name === 'appointments' || view.name === 'new-patient') && (
-            <button
-              onClick={() => setView({ name: 'home' })}
-              className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-            >
-              ← Back to Patients
-            </button>
-          )}
-          {view.name === 'session' && (
-            <button
-              onClick={() => setView({ name: 'workspace', patient: view.patient })}
-              className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-            >
-              ← Back to Workspace
-            </button>
-          )}
-        </header>
+        <AppHeader
+          onLogoClick={handleLogoClick}
+          leftSlot={
+            <>
+              {view.name !== 'new-patient' && (
+                <button
+                  onClick={() => setIsSidebarOpen(v => !v)}
+                  className="p-1.5 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 hover:opacity-70 transition-all duration-150"
+                  style={{ background: '#f3f4f6' }}
+                  title="Toggle sidebar"
+                >
+                  <Menu size={16} />
+                </button>
+              )}
+              {(view.name === 'workspace' || view.name === 'appointments' || view.name === 'new-patient' || view.name === 'all-patients') && (
+                <button
+                  onClick={() => setView({ name: view.name === 'workspace' ? returnTo : 'home' })}
+                  className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+                >
+                  ← Back to Patients
+                </button>
+              )}
+              {view.name === 'session' && (
+                <button
+                  onClick={() => setView({ name: 'workspace', patient: view.patient })}
+                  className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+                >
+                  ← Back to Workspace
+                </button>
+              )}
+            </>
+          }
+        />
         <main className="flex-1 overflow-y-auto min-w-0">
         {view.name === 'home' && (
           <div
@@ -1675,7 +1822,7 @@ export default function NurseDashboard() {
         {view.name === 'new-patient' && (
           <NewPatientView
             onBack={() => setView({ name: 'home' })}
-            onCreated={p => { setPatientListKey(k => k + 1); setView({ name: 'workspace', patient: p }); }}
+            onCreated={p => { setPatientListKey(k => k + 1); setReturnTo('home'); setView({ name: 'workspace', patient: p }); }}
           />
         )}
         {view.name === 'workspace' && (
@@ -1694,6 +1841,12 @@ export default function NurseDashboard() {
         )}
         {view.name === 'appointments' && (
           <AppointmentsView currentUserId={user!.user_id} />
+        )}
+        {view.name === 'all-patients' && (
+          <AllPatientsNurseView
+            patients={sortedPatients}
+            onSelectPatient={p => { setReturnTo('all-patients'); setView({ name: 'workspace', patient: p }); }}
+          />
         )}
         </main>
       </div>

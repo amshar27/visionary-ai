@@ -1,14 +1,18 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { RefreshCw, LogOut, Search, Menu, ChevronLeft, CalendarDays, X, ChevronRight, Mail, Pencil } from 'lucide-react';
+import { RefreshCw, LogOut, Search, Menu, ChevronLeft, CalendarDays, X, ChevronRight, Mail, Pencil, Eraser } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ReactMarkdown from 'react-markdown';
 import { useAuth } from '../context/AuthContext';
-import { screeningsAPI, uploadsAPI, aiAPI, appointmentsAPI } from '../services/api';
+import { screeningsAPI, uploadsAPI, aiAPI, appointmentsAPI, patientsAPI } from '../services/api';
 import { formatDt, getEyeSide, fmtConfidence } from '../utils/format';
-import type { ScreeningSession, RetinalImage, AIResult, DoctorReview, RAGSummaryResponse, Appointment } from '../types';
+import type { ScreeningSession, RetinalImage, AIResult, DoctorReview, RAGSummaryResponse, Appointment, Patient } from '../types';
 import type { User } from '../types';
 import RagReportEditor, { type RagReportEditorHandle } from '../components/RagReportEditor';
+import Pagination from '../components/Pagination';
+import AppHeader from '../components/AppHeader';
+
+const PAGE_SIZE = 15;
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
 
@@ -154,9 +158,15 @@ function EyePanel({
 
 // ─── View type ────────────────────────────────────────────────────────────────
 
+type ReturnTo =
+  | { kind: 'inbox' }
+  | { kind: 'patient-history'; patient_id: string; patient_name: string };
+
 type DoctorView =
   | { name: 'inbox' }
-  | { name: 'review'; sessionId: string; patientName: string }
+  | { name: 'patient-history'; patient_id: string; patient_name: string }
+  | { name: 'all-patients' }
+  | { name: 'review'; sessionId: string; patientName: string; returnTo: ReturnTo }
   | { name: 'appointments' };
 
 // ─── Sub-view: Doctor Inbox ───────────────────────────────────────────────────
@@ -164,13 +174,20 @@ type DoctorView =
 function InboxView({
   user,
   onOpen,
+  clearedIds,
+  onClear,
 }: {
   user: User;
   onOpen: (s: ScreeningSession) => void;
+  clearedIds: Set<string>;
+  onClear: (idsToClear: string[]) => void;
 }) {
   const [sessions, setSessions] = useState<ScreeningSession[]>([]);
   const [statusFilter, setStatusFilter] = useState('all');
   const [loading, setLoading] = useState(true);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [page, setPage] = useState(1);
+  const tableRef = useRef<HTMLDivElement | null>(null);
 
   const load = () => {
     setLoading(true);
@@ -182,17 +199,58 @@ function InboxView({
 
   useEffect(() => { load(); }, [user.user_id]);
 
+  const visibleSessions = useMemo(
+    () => sessions.filter(s => !clearedIds.has(s.id)),
+    [sessions, clearedIds]
+  );
+
   const filtered = statusFilter === 'all'
-    ? sessions
-    : sessions.filter(s => s.status === statusFilter);
+    ? visibleSessions
+    : visibleSessions.filter(s => s.status === statusFilter);
+
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    if (page > totalPages) setPage(1);
+  }, [filtered.length, page]);
+
+  const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  const clearableIds = useMemo(
+    () => visibleSessions
+      .filter(s => ['approved', 'overridden'].includes(s.status?.toLowerCase()))
+      .map(s => s.id),
+    [visibleSessions]
+  );
+  const clearableCount = clearableIds.length;
+
+  const handleConfirmClear = () => {
+    onClear(clearableIds);
+    toast.success(`Cleared ${clearableCount} session(s) from inbox`);
+    setShowClearConfirm(false);
+    setPage(1);
+  };
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-1">
         <h2 className="text-2xl font-bold text-gray-900">Doctor Inbox</h2>
-        <button onClick={load} className="p-2 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#f3f4f6' }}>
-          <RefreshCw size={14} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => clearableCount > 0 && setShowClearConfirm(true)}
+            disabled={clearableCount === 0}
+            title={clearableCount === 0 ? 'No finished sessions to clear' : 'Hide approved/overridden sessions from inbox'}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold ${
+              clearableCount === 0
+                ? 'bg-gray-200 text-gray-400 border-none opacity-60 cursor-not-allowed shadow-none'
+                : 'bg-red-500 hover:bg-red-600 text-white border-none shadow-sm hover:shadow-md transition-all duration-150 cursor-pointer'
+            }`}
+          >
+            <Eraser size={13} /> Clear
+          </button>
+          <button onClick={load} className="p-2 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#f3f4f6' }}>
+            <RefreshCw size={14} />
+          </button>
+        </div>
       </div>
       <p className="text-sm mb-4 text-gray-500">These are screening sessions assigned to you.</p>
 
@@ -201,7 +259,7 @@ function InboxView({
         {['all', 'assigned', 'approved', 'overridden'].map(opt => (
           <button
             key={opt}
-            onClick={() => setStatusFilter(opt)}
+            onClick={() => { setStatusFilter(opt); setPage(1); }}
             className="px-3 py-1 rounded-xl text-xs font-semibold transition-all duration-200 cursor-pointer hover:brightness-90 hover:scale-[1.02] active:scale-[0.98]"
             style={{
               background: statusFilter === opt ? '#3b82f6' : '#f3f4f6',
@@ -221,12 +279,16 @@ function InboxView({
         <p className="text-sm text-gray-500">No sessions found for the selected filter.</p>
       )}
       {!loading && filtered.length > 0 && (
-        <>
-          <p className="text-xs mb-3 text-gray-400">Showing {filtered.length} session(s).</p>
+        <div ref={tableRef}>
+          <p className="text-xs mb-3 text-gray-400">
+            {filtered.length > PAGE_SIZE
+              ? `Showing ${paginated.length} of ${filtered.length} session(s).`
+              : `Showing ${filtered.length} session(s).`}
+          </p>
           <div className="grid text-xs font-bold uppercase tracking-wide pb-2 mb-1 text-gray-400" style={{ gridTemplateColumns: '90px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #e5e7eb' }}>
             <span>Session No.</span><span>Date</span><span>Patient</span><span>Assigned By</span><span>Status</span><span>Action</span>
           </div>
-          {filtered.map(s => {
+          {paginated.map(s => {
             const raw = s as unknown as Record<string, unknown>;
             const sessionNo = raw.session_number as number ?? '-';
             const sessionDate = raw.session_date as string ?? s.created_at;
@@ -256,8 +318,165 @@ function InboxView({
               </div>
             );
           })}
+          <Pagination
+            totalItems={filtered.length}
+            itemsPerPage={PAGE_SIZE}
+            currentPage={page}
+            onPageChange={setPage}
+            scrollTargetRef={tableRef}
+          />
           <p className="text-xs mt-3 text-gray-400">Tip: Approved/overridden sessions open in read-only mode.</p>
-        </>
+        </div>
+      )}
+
+      {showClearConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
+          <div className="w-full max-w-sm mx-4 p-6 rounded-2xl bg-white" style={{ boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}>
+            <div className="flex items-center gap-3 mb-3"><Eraser size={18} className="text-gray-600" /><h3 className="text-lg font-bold text-gray-900">Clear finished sessions from inbox?</h3></div>
+            <p className="text-sm text-gray-600 mb-3">This will hide all approved and overridden sessions from your inbox view. They will remain accessible by selecting the patient from the sidebar. Assigned sessions will not be affected.</p>
+            <p className="text-sm font-bold text-gray-900 mb-5">{clearableCount} session(s) will be cleared.</p>
+            <div className="flex gap-3">
+              <button onClick={() => setShowClearConfirm(false)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+              <button onClick={handleConfirmClear} className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200" style={{ background: '#2563eb' }}>Clear</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Sub-view: Patient History (per-patient session list) ────────────────────
+
+function PatientHistoryView({
+  user,
+  patientId,
+  patientName,
+  onOpen,
+}: {
+  user: User;
+  patientId: string;
+  patientName: string;
+  onOpen: (s: ScreeningSession) => void;
+}) {
+  const [sessions, setSessions] = useState<ScreeningSession[]>([]);
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const tableRef = useRef<HTMLDivElement | null>(null);
+
+  const load = () => {
+    setLoading(true);
+    screeningsAPI.getAssignedToDoctor(user.user_id)
+      .then(r => setSessions(r.data ?? []))
+      .catch(() => toast.error('Could not load patient history.'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); setPage(1); }, [user.user_id, patientId]);
+
+  const patientSessions = useMemo(() => sessions.filter(s => {
+    const enriched = s as unknown as Record<string, unknown>;
+    const pid =
+      (enriched['patient_id'] as string | undefined) ??
+      ((enriched['patients'] as Record<string, unknown> | undefined)?.['id'] as string | undefined);
+    return pid === patientId;
+  }), [sessions, patientId]);
+
+  const filtered = statusFilter === 'all'
+    ? patientSessions
+    : patientSessions.filter(s => s.status === statusFilter);
+
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    if (page > totalPages) setPage(1);
+  }, [filtered.length, page]);
+
+  const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  return (
+    <div className="p-6 max-w-5xl mx-auto">
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-2xl font-bold text-gray-900">{patientName} — Screening History</h2>
+        <button onClick={load} className="p-2 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#f3f4f6' }}>
+          <RefreshCw size={14} />
+        </button>
+      </div>
+      <p className="text-sm mb-4 text-gray-500">All screening sessions assigned to you for this patient (including cleared ones).</p>
+
+      <div className="flex items-center gap-2 mb-4">
+        <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Status:</span>
+        {['all', 'assigned', 'approved', 'overridden'].map(opt => (
+          <button
+            key={opt}
+            onClick={() => { setStatusFilter(opt); setPage(1); }}
+            className="px-3 py-1 rounded-xl text-xs font-semibold transition-all duration-200 cursor-pointer hover:brightness-90 hover:scale-[1.02] active:scale-[0.98]"
+            style={{
+              background: statusFilter === opt ? '#3b82f6' : '#f3f4f6',
+              color: statusFilter === opt ? '#fff' : '#6b7280',
+              border: '1px solid ' + (statusFilter === opt ? '#3b82f6' : '#e5e7eb'),
+            }}
+          >
+            {opt}
+          </button>
+        ))}
+      </div>
+
+      <hr style={{ borderColor: '#e5e7eb', marginBottom: 12 }} />
+
+      {loading && <p className="text-sm text-gray-500">Loading…</p>}
+      {!loading && filtered.length === 0 && (
+        <p className="text-sm text-gray-500">No sessions found for the selected filter.</p>
+      )}
+      {!loading && filtered.length > 0 && (
+        <div ref={tableRef}>
+          <p className="text-xs mb-3 text-gray-400">
+            {filtered.length > PAGE_SIZE
+              ? `Showing ${paginated.length} of ${filtered.length} session(s).`
+              : `Showing ${filtered.length} session(s).`}
+          </p>
+          <div className="grid text-xs font-bold uppercase tracking-wide pb-2 mb-1 text-gray-400" style={{ gridTemplateColumns: '90px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #e5e7eb' }}>
+            <span>Session No.</span><span>Date</span><span>Patient</span><span>Assigned By</span><span>Status</span><span>Action</span>
+          </div>
+          {paginated.map(s => {
+            const raw = s as unknown as Record<string, unknown>;
+            const sessionNo = raw.session_number as number ?? '-';
+            const sessionDate = raw.session_date as string ?? s.created_at;
+            const pName = extractPatientName(s);
+            const assignedBy = extractAssignedByName(s);
+            const isFinalized = ['approved', 'overridden'].includes(s.status?.toLowerCase());
+            return (
+              <div key={s.id} className="grid items-center py-3" style={{ gridTemplateColumns: '90px 1fr 1fr 1fr 100px 90px', borderBottom: '1px solid #f3f4f6' }}>
+                <span className="text-sm text-gray-900">{String(sessionNo)}</span>
+                <span className="text-sm text-gray-600">{formatDt(sessionDate)}</span>
+                <span className="text-sm text-gray-900 font-medium">{pName}</span>
+                <span className="text-sm text-gray-600">{assignedBy}</span>
+                <StatusBadge status={s.status} />
+                <button
+                  onClick={() => onOpen(s)}
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold transition-all duration-200 cursor-pointer hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
+                  style={
+                    isFinalized
+                      ? { background: '#fff', border: '1px solid #d1d5db', color: '#374151' }
+                      : { background: '#2563eb', color: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
+                  }
+                  onMouseEnter={e => { e.currentTarget.style.background = isFinalized ? '#f9fafb' : '#1d4ed8'; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = isFinalized ? '#fff' : '#2563eb'; }}
+                >
+                  {isFinalized ? 'View' : 'Open'}
+                </button>
+              </div>
+            );
+          })}
+          <Pagination
+            totalItems={filtered.length}
+            itemsPerPage={PAGE_SIZE}
+            currentPage={page}
+            onPageChange={setPage}
+            scrollTargetRef={tableRef}
+          />
+          <p className="text-xs mt-3 text-gray-400">Tip: Approved/overridden sessions open in read-only mode.</p>
+        </div>
       )}
     </div>
   );
@@ -288,12 +507,16 @@ function ReviewView({
   onBack,
   user,
   refreshKey,
+  isEditingReport,
+  setIsEditingReport,
 }: {
   sessionId: string;
   patientName: string;
   onBack: () => void;
   user: User;
   refreshKey?: number;
+  isEditingReport: boolean;
+  setIsEditingReport: (v: boolean) => void;
 }) {
   const [session, setSession] = useState<ScreeningSession | null>(null);
   const [images, setImages] = useState<RetinalImage[]>([]);
@@ -302,7 +525,6 @@ function ReviewView({
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [ragResult, setRagResult] = useState<RAGSummaryResponse | null>(null);
   const [ragLoading, setRagLoading] = useState(false);
-  const [isEditingReport, setIsEditingReport] = useState(false);
   const [showSaveReportConfirm, setShowSaveReportConfirm] = useState(false);
   const reportEditorRef = useRef<RagReportEditorHandle>(null);
 
@@ -1028,6 +1250,100 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
   );
 }
 
+// ─── Sub-view: All Patients (Doctor) ─────────────────────────────────────────
+
+function AllPatientsDoctorView({
+  patients,
+  patientIcMap,
+  sessionCountByPatient,
+  onSelectPatient,
+}: {
+  patients: { patient_id: string; patient_name: string; latest: number }[];
+  patientIcMap: Map<string, string>;
+  sessionCountByPatient: Map<string, number>;
+  onSelectPatient: (patient_id: string, patient_name: string) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [page, setPage] = useState(1);
+  const tableRef = useRef<HTMLDivElement | null>(null);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return patients;
+    return patients.filter(p => {
+      const ic = patientIcMap.get(p.patient_id)?.toLowerCase() ?? '';
+      return p.patient_name.toLowerCase().includes(q) || ic.includes(q);
+    });
+  }, [patients, patientIcMap, query]);
+
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    if (page > totalPages) setPage(1);
+  }, [filtered.length, page]);
+
+  const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  return (
+    <div className="p-6 max-w-5xl mx-auto">
+      <h2 className="text-2xl font-bold text-gray-900 mb-1">All Patients</h2>
+      <p className="text-sm mb-4 text-gray-500">Patients with sessions assigned to you.</p>
+
+      <div className="relative mb-4">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+        <input
+          value={query}
+          onChange={e => { setQuery(e.target.value); setPage(1); }}
+          placeholder="Search patient by name or IC..."
+          className="w-full pl-9 pr-3 py-2 rounded-xl text-sm outline-none"
+          style={inputStyle}
+        />
+      </div>
+
+      <hr style={{ borderColor: '#e5e7eb', marginBottom: 12 }} />
+
+      {patients.length === 0 ? (
+        <p className="text-sm text-gray-500">No patients yet.</p>
+      ) : filtered.length === 0 ? (
+        <p className="text-sm text-gray-500">No patients match your search.</p>
+      ) : (
+        <div ref={tableRef}>
+          <p className="text-xs mb-3 text-gray-400">
+            {filtered.length > PAGE_SIZE
+              ? `Showing ${paginated.length} of ${filtered.length} patient(s).`
+              : `Showing ${filtered.length} patient(s).`}
+          </p>
+          <div className="grid text-xs font-bold uppercase tracking-wide pb-2 mb-1 text-gray-400" style={{ gridTemplateColumns: '2fr 1.5fr 100px', borderBottom: '1px solid #e5e7eb' }}>
+            <span>Name</span><span>IC / Passport</span><span className="text-right">Sessions</span>
+          </div>
+          {paginated.map(p => {
+            const ic = patientIcMap.get(p.patient_id) ?? '—';
+            const count = sessionCountByPatient.get(p.patient_id) ?? 0;
+            return (
+              <div key={p.patient_id} className="grid items-center py-3" style={{ gridTemplateColumns: '2fr 1.5fr 100px', borderBottom: '1px solid #f3f4f6' }}>
+                <button
+                  onClick={() => onSelectPatient(p.patient_id, p.patient_name)}
+                  className="text-left text-sm font-semibold text-blue-600 hover:text-blue-800 hover:underline cursor-pointer"
+                >
+                  {p.patient_name}
+                </button>
+                <span className="text-sm text-gray-600">{ic}</span>
+                <span className="text-sm text-gray-900 text-right tabular-nums">{count}</span>
+              </div>
+            );
+          })}
+          <Pagination
+            totalItems={filtered.length}
+            itemsPerPage={PAGE_SIZE}
+            currentPage={page}
+            onPageChange={setPage}
+            scrollTargetRef={tableRef}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main: Doctor Dashboard ───────────────────────────────────────────────────
 
 export default function DoctorDashboard() {
@@ -1040,6 +1356,25 @@ export default function DoctorDashboard() {
   const [isDragging, setIsDragging] = useState(false);
   const [sidebarQuery, setSidebarQuery] = useState('');
   const [assignedSessions, setAssignedSessions] = useState<ScreeningSession[]>([]);
+  const [isEditingReport, setIsEditingReport] = useState(false);
+  const [showLogoLeaveConfirm, setShowLogoLeaveConfirm] = useState(false);
+
+  const storageKey = `visionary_doctor_cleared_${user?.user_id ?? ''}`;
+  const [clearedIds, setClearedIds] = useState<Set<string>>(() => {
+    try {
+      const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
+      return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+    } catch {
+      return new Set();
+    }
+  });
+
+  useEffect(() => {
+    if (!user?.user_id) return;
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(Array.from(clearedIds)));
+    } catch { /* ignore quota errors */ }
+  }, [clearedIds, user?.user_id, storageKey]);
 
   useEffect(() => {
     if (!user) return;
@@ -1048,12 +1383,92 @@ export default function DoctorDashboard() {
       .catch(() => {});
   }, [user, view.name]);
 
-  const filtered = sidebarQuery
-    ? assignedSessions.filter(s => {
-        const name = extractPatientName(s).toLowerCase();
-        return name.includes(sidebarQuery.toLowerCase()) || s.status.includes(sidebarQuery.toLowerCase());
+  useEffect(() => {
+    if (assignedSessions.length === 0) return;
+    const validIds = new Set(assignedSessions.map(s => s.id));
+    setClearedIds(prev => {
+      const filtered = new Set<string>();
+      for (const id of prev) if (validIds.has(id)) filtered.add(id);
+      return filtered.size === prev.size ? prev : filtered;
+    });
+  }, [assignedSessions]);
+
+  const patients = useMemo(() => {
+    const map = new Map<string, { patient_id: string; patient_name: string; latest: number }>();
+    for (const s of assignedSessions) {
+      const enriched = s as unknown as Record<string, unknown>;
+      const pid =
+        (enriched['patient_id'] as string | undefined) ??
+        ((enriched['patients'] as Record<string, unknown> | undefined)?.['id'] as string | undefined);
+      const pname = extractPatientName(s) || '(Unknown)';
+      const dateStr = (enriched['session_date'] as string | undefined) ?? (enriched['created_at'] as string | undefined);
+      const ts = dateStr ? new Date(dateStr).getTime() : 0;
+      if (!pid) continue;
+      const existing = map.get(pid);
+      if (!existing || ts > existing.latest) {
+        map.set(pid, { patient_id: pid, patient_name: pname, latest: ts });
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => b.latest - a.latest);
+  }, [assignedSessions]);
+
+  const topPatients = useMemo(() => patients.slice(0, 5), [patients]);
+
+  const sessionCountByPatient = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const s of assignedSessions) {
+      const enriched = s as unknown as Record<string, unknown>;
+      const pid =
+        (enriched['patient_id'] as string | undefined) ??
+        ((enriched['patients'] as Record<string, unknown> | undefined)?.['id'] as string | undefined);
+      if (!pid) continue;
+      counts.set(pid, (counts.get(pid) ?? 0) + 1);
+    }
+    return counts;
+  }, [assignedSessions]);
+
+  const [patientIcMap, setPatientIcMap] = useState<Map<string, string>>(new Map());
+  useEffect(() => {
+    patientsAPI.search(undefined, 200)
+      .then(r => {
+        const m = new Map<string, string>();
+        for (const p of (r.data ?? []) as Patient[]) m.set(p.id, p.ic_passport);
+        setPatientIcMap(m);
       })
-    : assignedSessions;
+      .catch(() => {});
+  }, []);
+
+  const sidebarDisplayPatients = sidebarQuery.trim()
+    ? patients.filter(p => p.patient_name.toLowerCase().includes(sidebarQuery.trim().toLowerCase()))
+    : topPatients;
+
+  const handleClearSessions = (ids: string[]) => {
+    setClearedIds(prev => {
+      const next = new Set(prev);
+      for (const id of ids) next.add(id);
+      return next;
+    });
+  };
+
+  const handleReviewBack = () => {
+    if (view.name !== 'review') { setView({ name: 'inbox' }); return; }
+    const rt = view.returnTo;
+    if (rt.kind === 'patient-history') {
+      setView({ name: 'patient-history', patient_id: rt.patient_id, patient_name: rt.patient_name });
+    } else {
+      setView({ name: 'inbox' });
+    }
+  };
+
+  const headerBackLabel = '← Back';
+
+  const handleLogoClick = () => {
+    if (isEditingReport) {
+      setShowLogoLeaveConfirm(true);
+      return;
+    }
+    setView({ name: 'inbox' });
+  };
 
   const handleLogout = () => { logout(); navigate('/login', { replace: true }); };
 
@@ -1086,45 +1501,62 @@ export default function DoctorDashboard() {
         </div>
 
         {/* My Schedule nav */}
-        <div className="px-3 pt-3 pb-1">
-          <button onClick={() => setView({ name: 'appointments' })} className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-all duration-200 mb-2 cursor-pointer hover:brightness-110 hover:scale-[1.02] active:scale-[0.98] ${view.name === 'appointments' ? 'bg-blue-50 text-blue-700' : 'text-gray-700 hover:bg-gray-100'}`}>
-            <CalendarDays size={15} className="shrink-0" /> My Schedule
+        <div className="px-3 py-2" style={{ borderBottom: '1px solid #f3f4f6' }}>
+          <button
+            onClick={() => setView({ name: 'appointments' })}
+            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm font-semibold transition-all duration-150 cursor-pointer hover:shadow-sm"
+            style={{
+              background: view.name === 'appointments' ? '#dbeafe' : 'transparent',
+              color: view.name === 'appointments' ? '#1d4ed8' : '#374151',
+            }}
+            onMouseEnter={e => { if (view.name !== 'appointments') e.currentTarget.style.background = '#f3f4f6'; }}
+            onMouseLeave={e => { if (view.name !== 'appointments') e.currentTarget.style.background = 'transparent'; }}
+          >
+            <CalendarDays size={15} /> My Schedule
           </button>
         </div>
 
-        {/* Assigned sessions search */}
+        {/* Patient search */}
         <div className="px-3 pt-1 pb-1">
-          <p className="text-xs font-bold uppercase tracking-widest mb-2 text-gray-400">Assigned Sessions</p>
-          <div className="relative mb-1">
+          <p className="text-xs font-bold uppercase tracking-widest mb-2 text-gray-400">My Patients</p>
+          <div className="relative mb-2">
             <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
-            <input className="w-full pl-7 pr-2 py-1.5 rounded-xl text-xs outline-none" style={inputStyle} placeholder="Search patient…" value={sidebarQuery} onChange={e => setSidebarQuery(e.target.value)} />
+            <input className="w-full pl-7 pr-2 py-1.5 rounded-xl text-xs outline-none" style={inputStyle} placeholder="Search patient..." value={sidebarQuery} onChange={e => setSidebarQuery(e.target.value)} />
           </div>
-          <p className="text-xs mb-2 text-gray-400">Quick open any case</p>
         </div>
 
-        {/* Session list */}
+        {/* Patient list */}
         <div className="flex-1 overflow-y-auto px-3 pb-2">
-          {filtered.map(s => {
-            const raw = s as unknown as Record<string, unknown>;
-            const patientName = extractPatientName(s);
-            const sessionNo = raw.session_number as number ?? '-';
-            const isFinalized = ['approved', 'overridden'].includes(s.status?.toLowerCase());
+          {patients.length === 0 && (
+            <p className="text-xs px-1 text-gray-400">No patients yet. Sessions will appear here once nurses assign them to you.</p>
+          )}
+          {patients.length > 0 && sidebarDisplayPatients.length === 0 && (
+            <p className="text-xs px-1 text-gray-400">No patients match your search.</p>
+          )}
+          {sidebarDisplayPatients.map(p => {
+            const isActive = view.name === 'patient-history' && view.patient_id === p.patient_id;
             return (
-              <div key={s.id} className="mb-1">
+              <div key={p.patient_id} className="mb-1">
                 <button
-                  onClick={() => setView({ name: 'review', sessionId: s.id, patientName })}
-                  className="w-full text-left px-3 py-2 rounded-xl text-xs transition-all duration-200 cursor-pointer hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-                  style={{ background: '#f9fafb', color: isFinalized ? '#6b7280' : '#111827' }}
-                  onMouseEnter={e => (e.currentTarget.style.background = '#f3f4f6')}
-                  onMouseLeave={e => (e.currentTarget.style.background = '#f9fafb')}
+                  onClick={() => setView({ name: 'patient-history', patient_id: p.patient_id, patient_name: p.patient_name })}
+                  className="w-full text-left px-3 py-2 rounded-xl text-sm text-gray-900 cursor-pointer"
+                  style={{ background: isActive ? '#dbeafe' : '#f9fafb', color: isActive ? '#1d4ed8' : '#111827', fontWeight: isActive ? 600 : 400 }}
+                  onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = '#f3f4f6'; }}
+                  onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = '#f9fafb'; }}
                 >
-                  {patientName} — Session #{String(sessionNo)}
-                  {isFinalized && <span className="ml-1.5 text-gray-400">(view)</span>}
+                  {p.patient_name}
                 </button>
               </div>
             );
           })}
-          {filtered.length === 0 && <p className="text-xs px-1 text-gray-400">No assigned sessions found.</p>}
+          {patients.length > 0 && (
+            <button
+              onClick={() => setView({ name: 'all-patients' })}
+              className="block w-full text-left px-3 py-2 mt-1 text-sm text-blue-600 hover:text-blue-800 hover:underline cursor-pointer"
+            >
+              See more patients →
+            </button>
+          )}
         </div>
 
         <hr style={{ borderColor: '#e5e7eb' }} />
@@ -1139,24 +1571,94 @@ export default function DoctorDashboard() {
 
       {/* Main content */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
-        <header className="flex-none flex items-center px-3 py-2 border-b border-gray-200" style={{ background: '#fff' }}>
-          <button onClick={() => setIsSidebarOpen(v => !v)} className="p-1.5 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200" style={{ background: '#f3f4f6' }} title="Toggle sidebar"><Menu size={16} /></button>
-          {(view.name === 'review' || view.name === 'appointments') && (
-            <button onClick={() => setView({ name: 'inbox' })} className="ml-3 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200">← Back to Inbox</button>
-          )}
-        </header>
+        <AppHeader
+          onLogoClick={handleLogoClick}
+          leftSlot={
+            <>
+              <button onClick={() => setIsSidebarOpen(v => !v)} className="p-1.5 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200" style={{ background: '#f3f4f6' }} title="Toggle sidebar"><Menu size={16} /></button>
+              {view.name === 'review' && (
+                <button onClick={handleReviewBack} className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200">{headerBackLabel}</button>
+              )}
+              {(view.name === 'patient-history' || view.name === 'appointments' || view.name === 'all-patients') && (
+                <button onClick={() => setView({ name: 'inbox' })} className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200">← Back to Inbox</button>
+              )}
+            </>
+          }
+        />
         <main className="flex-1 overflow-y-auto min-w-0">
           {view.name === 'inbox' && user && (
-            <InboxView user={user} onOpen={s => { const patientName = extractPatientName(s); setView({ name: 'review', sessionId: s.id, patientName }); }} />
+            <InboxView
+              user={user}
+              clearedIds={clearedIds}
+              onClear={handleClearSessions}
+              onOpen={s => {
+                const patientName = extractPatientName(s);
+                setView({ name: 'review', sessionId: s.id, patientName, returnTo: { kind: 'inbox' } });
+              }}
+            />
+          )}
+          {view.name === 'patient-history' && user && (
+            <PatientHistoryView
+              user={user}
+              patientId={view.patient_id}
+              patientName={view.patient_name}
+              onOpen={s => {
+                const patientName = extractPatientName(s);
+                setView({
+                  name: 'review',
+                  sessionId: s.id,
+                  patientName,
+                  returnTo: { kind: 'patient-history', patient_id: view.patient_id, patient_name: view.patient_name },
+                });
+              }}
+            />
           )}
           {view.name === 'review' && user && (
-            <ReviewView sessionId={view.sessionId} patientName={view.patientName} onBack={() => setView({ name: 'inbox' })} user={user} refreshKey={reviewRefreshKey} />
+            <ReviewView
+              sessionId={view.sessionId}
+              patientName={view.patientName}
+              onBack={handleReviewBack}
+              user={user}
+              refreshKey={reviewRefreshKey}
+              isEditingReport={isEditingReport}
+              setIsEditingReport={setIsEditingReport}
+            />
           )}
           {view.name === 'appointments' && user && (
             <DoctorAppointmentsView doctorId={user.user_id} />
           )}
+          {view.name === 'all-patients' && user && (
+            <AllPatientsDoctorView
+              patients={patients}
+              patientIcMap={patientIcMap}
+              sessionCountByPatient={sessionCountByPatient}
+              onSelectPatient={(pid, pname) => setView({ name: 'patient-history', patient_id: pid, patient_name: pname })}
+            />
+          )}
         </main>
       </div>
+
+      {showLogoLeaveConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.4)' }}>
+          <div className="w-full max-w-sm mx-4 p-6 rounded-2xl bg-white" style={{ boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}>
+            <h3 className="text-lg font-bold text-gray-900 mb-3">You have unsaved changes</h3>
+            <p className="text-sm text-gray-600 mb-5">Your clinical summary edits will be lost if you leave this page. Are you sure?</p>
+            <div className="flex gap-3">
+              <button onClick={() => setShowLogoLeaveConfirm(false)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+              <button
+                onClick={() => {
+                  setIsEditingReport(false);
+                  setShowLogoLeaveConfirm(false);
+                  setView({ name: 'inbox' });
+                }}
+                className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white bg-red-500 hover:bg-red-600 cursor-pointer transition-all duration-150 shadow-sm hover:shadow-md"
+              >
+                Leave anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,10 +1,14 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw, LogOut, Shield, Save, KeyRound, Trash2, Users, UserRound } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuth } from '../context/AuthContext';
 import { adminAPI } from '../services/api';
 import type { StaffUser, Patient } from '../types';
+import AppHeader from '../components/AppHeader';
+import Pagination from '../components/Pagination';
+
+const ADMIN_PAGE_SIZE = 10;
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
 
@@ -42,6 +46,8 @@ function RoleBadge({ role }: { role: string }) {
 function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
   const [staff, setStaff] = useState<StaffUser[]>([]);
   const [loading, setLoading] = useState(true);
+  const [usersPage, setUsersPage] = useState(1);
+  const tableRef = useRef<HTMLDivElement | null>(null);
 
   // Update name form
   const [updateStaffId, setUpdateStaffId] = useState('');
@@ -74,6 +80,12 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
 
   useEffect(() => { load(); }, []);
 
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(staff.length / ADMIN_PAGE_SIZE));
+    if (usersPage > totalPages) setUsersPage(1);
+  }, [staff.length, usersPage]);
+
+  const paginatedStaff = staff.slice((usersPage - 1) * ADMIN_PAGE_SIZE, usersPage * ADMIN_PAGE_SIZE);
   const staffIds = staff.map(s => s.staff_id);
   const getRow = (sid: string) => staff.find(s => s.staff_id === sid);
   const updateRow = getRow(updateStaffId);
@@ -128,12 +140,8 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
 
   return (
     <div className="space-y-6">
-      <div className="px-3 py-2 rounded-xl text-xs shadow-md" style={{ background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8' }}>
-        Email + Role are read-only (HR-controlled). Admin can update Name and reset Password, or delete the login account.
-      </div>
-
       {/* Table */}
-      <div style={cardStyle}>
+      <div ref={tableRef} style={cardStyle}>
         <h3 className="text-sm font-bold text-gray-900 mb-3">System Users</h3>
         <div style={{ overflowX: 'auto' }}>
           <table className="w-full">
@@ -143,7 +151,7 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
               </tr>
             </thead>
             <tbody>
-              {staff.map(s => (
+              {paginatedStaff.map(s => (
                 <tr key={s.id}>
                   <td style={tdStyle}><code className="text-xs text-blue-600">{s.staff_id}</code></td>
                   <td style={tdStyle}>{s.name ?? '-'}</td>
@@ -155,6 +163,13 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
             </tbody>
           </table>
         </div>
+        <Pagination
+          totalItems={staff.length}
+          itemsPerPage={ADMIN_PAGE_SIZE}
+          currentPage={usersPage}
+          onPageChange={setUsersPage}
+          scrollTargetRef={tableRef}
+        />
       </div>
 
       {/* Update name */}
@@ -248,6 +263,8 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
 function PatientsTab({ requesterRole }: { requesterRole: string }) {
   const [patients, setPatients] = useState<Patient[]>([]);
   const [loading, setLoading] = useState(true);
+  const [patientsPage, setPatientsPage] = useState(1);
+  const tableRef = useRef<HTMLDivElement | null>(null);
 
   // Update form
   const [updateIc, setUpdateIc] = useState('');
@@ -276,6 +293,12 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
 
   useEffect(() => { load(); }, []);
 
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(patients.length / ADMIN_PAGE_SIZE));
+    if (patientsPage > totalPages) setPatientsPage(1);
+  }, [patients.length, patientsPage]);
+
+  const paginatedPatients = patients.slice((patientsPage - 1) * ADMIN_PAGE_SIZE, patientsPage * ADMIN_PAGE_SIZE);
   const icList = patients.map(p => p.ic_passport);
   const getPatient = (ic: string) => patients.find(p => p.ic_passport === ic);
   const updatePatient = getPatient(updateIc);
@@ -328,7 +351,7 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
   return (
     <div className="space-y-6">
       {/* Table */}
-      <div style={cardStyle}>
+      <div ref={tableRef} style={cardStyle}>
         <h3 className="text-sm font-bold text-gray-900 mb-3">All Patients</h3>
         <div style={{ overflowX: 'auto' }}>
           <table className="w-full">
@@ -338,7 +361,7 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
               </tr>
             </thead>
             <tbody>
-              {patients.map(p => (
+              {paginatedPatients.map(p => (
                 <tr key={p.id}>
                   <td style={tdStyle}>{p.name}</td>
                   <td style={tdStyle}><code className="text-xs text-blue-600">{p.ic_passport}</code></td>
@@ -352,6 +375,13 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
             </tbody>
           </table>
         </div>
+        <Pagination
+          totalItems={patients.length}
+          itemsPerPage={ADMIN_PAGE_SIZE}
+          currentPage={patientsPage}
+          onPageChange={setPatientsPage}
+          scrollTargetRef={tableRef}
+        />
       </div>
 
       {/* Update patient */}
@@ -437,26 +467,26 @@ export default function AdminDashboard() {
 
   const handleLogout = () => { logout(); navigate('/login', { replace: true }); };
 
+  const handleLogoClick = () => { setTab('users'); };
+
   return (
     <div className="min-h-screen" style={{ background: '#f9fafb', fontFamily: 'Inter, system-ui, sans-serif' }}>
-      {/* Top navigation bar */}
-      <div className="sticky top-0 z-50 flex items-center justify-between px-6 py-4 bg-white shadow-md" style={{ borderBottom: '1px solid #e5e7eb' }}>
-        <div className="flex items-center gap-3">
-          <Shield size={20} style={{ color: '#dc2626' }} />
-          <span className="font-bold text-gray-900">Visionary AI</span>
-          <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: '#fee2e2', border: '1px solid #fca5a5', color: '#dc2626' }}>Admin</span>
-        </div>
-        <div className="flex items-center gap-4">
-          <span className="text-sm text-gray-500">{user?.name ?? user?.email}</span>
-          <button
-            onClick={handleLogout}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-            style={{ background: '#fee2e2', border: '1px solid #fca5a5', color: '#dc2626' }}
-          >
-            <LogOut size={12} /> Sign Out
-          </button>
-        </div>
-      </div>
+      <AppHeader
+        onLogoClick={handleLogoClick}
+        leftSlot={<Shield size={18} style={{ color: '#dc2626' }} />}
+        rightSlot={
+          <div className="flex items-center gap-4">
+            <span className="text-sm text-gray-500">{user?.name ?? user?.email}</span>
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+              style={{ background: '#fee2e2', border: '1px solid #fca5a5', color: '#dc2626' }}
+            >
+              <LogOut size={12} /> Sign Out
+            </button>
+          </div>
+        }
+      />
 
       <div className="max-w-6xl mx-auto px-6 py-6">
         <div className="flex items-center justify-between mb-5">

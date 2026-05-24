@@ -17,8 +17,9 @@ Clinical-grade eye disease screening system built as a Final Year Project for Ma
 | LLM (summaries) | OpenAI `gpt-4o-mini` |
 | LLM (RAG reports) | OpenAI `gpt-4o` |
 | RAG pipeline | LangChain + OpenAI embeddings (`text-embedding-3-small`) + Supabase vector store |
-| RAG evaluation | RAGAS (`ragas` + HuggingFace `datasets`) — faithfulness, answer_relevancy, context_precision |
-| Multi-Agent Pipeline | CrewAI — two-agent crew (Researcher: gpt-4o-mini, Writer: gpt-4o) |
+| RAG evaluation | RAGAS (`ragas` + HuggingFace `datasets`) — faithfulness, answer_relevancy, context_utilization (lazy-imported) |
+| Multi-Agent Pipeline | CrewAI — two-agent crew (Researcher: gpt-4o-mini, Writer: gpt-4o) — see `backend/agents/` |
+| Rich-text editor | TipTap (`@tiptap/react`, `@tiptap/starter-kit`, `tiptap-markdown`) — WYSIWYG editing of RAG reports |
 | Auth | Custom bcrypt — no JWT; user object stored in `localStorage` |
 | Email | Resend (`RESEND_API_KEY`) |
 | Scheduler | APScheduler (BackgroundScheduler) — runs in-process |
@@ -78,6 +79,23 @@ visionary_ai/
 │   ├── notification_service.py   # Resend email: confirmation, reminder, clinical report, OTP
 │   ├── scheduler.py              # APScheduler: send_reminders + auto_no_show (every 1 min)
 │   ├── requirements.txt          # backend-specific deps
+│   ├── agents/                   # CrewAI multi-agent RAG pipeline
+│   │   ├── crew.py               # run_clinical_report_crew() — assembles + kicks off the crew
+│   │   ├── llms.py               # researcher_llm (gpt-4o-mini), writer_llm (gpt-4o)
+│   │   ├── agents/
+│   │   │   ├── researcher.py     # Clinical Evidence Researcher agent
+│   │   │   └── writer.py         # Clinical Report Writer agent
+│   │   ├── tasks/
+│   │   │   ├── research_task.py  # Researcher's task — classify worst case + retrieve guidelines
+│   │   │   └── report_task.py    # Writer's task — six-section markdown report + persist
+│   │   └── tools/                # CrewAI BaseTool subclasses
+│   │       ├── severity_classifier.py   # picks worst-case condition + builds search_query
+│   │       ├── guideline_retrieval.py   # match_documents RPC, top-5 chunks
+│   │       ├── patient_context.py       # patient demographics + risk factors
+│   │       ├── screening_history.py     # prior session severities for trend detection
+│   │       ├── diagnostic_assembler.py  # per-eye AI/doctor diagnosis summary
+│   │       ├── doctor_lookup.py         # assigned doctor's name for report header
+│   │       └── report_persist.py        # writes final markdown to ai_results.rag_summary
 │   └── model/
 │       └── best_model.pth        # trained ResNetWithAttention weights
 └── frontend-react/
@@ -87,14 +105,15 @@ visionary_ai/
     │   ├── context/
     │   │   └── AuthContext.tsx   # useAuth hook, localStorage session (key: visionary_user)
     │   ├── components/
-    │   │   └── ProtectedRoute.tsx  # role-based guard, redirects wrong-role to their home
+    │   │   ├── ProtectedRoute.tsx  # role-based guard, redirects wrong-role to their home
+    │   │   └── RagReportEditor.tsx # TipTap WYSIWYG markdown editor for doctor RAG report editing
     │   ├── pages/
     │   │   ├── Landing.tsx       # dark hero, redirects logged-in users to role dashboard
     │   │   ├── Login.tsx         # email/password form + "Forgot password?" link
     │   │   ├── Register.tsx      # staff_id + email + password (validated against registry)
     │   │   ├── ForgotPassword.tsx  # 4-step OTP password reset (email → OTP → new pw → success)
-    │   │   ├── NurseDashboard.tsx  # 5 sub-views: home, new-patient, workspace, session, appointments
-    │   │   ├── DoctorDashboard.tsx # 3 sub-views: inbox, review (inline edit), appointments
+    │   │   ├── NurseDashboard.tsx  # 6 sub-views: home, new-patient, workspace, session, appointments, all-patients
+    │   │   ├── DoctorDashboard.tsx # 5 sub-views: inbox, patient-history, all-patients, review (inline edit), appointments
     │   │   └── AdminDashboard.tsx  # top navbar + 2 tabs: users (staff), patients
     │   ├── services/
     │   │   └── api.ts            # Axios instance (baseURL: http://localhost:8000) + all API fns
@@ -155,13 +174,29 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use. Not currently called by the frontend.
 - `GET /ai/results/by-session/{id}` — returns ai_results rows for session
 - `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and sets `warnings` to `[]`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately). After this PATCH, `disease_type` and `severity_label` are the only fields carrying the doctor's diagnosis. Also invalidates the session-wide RAG by setting `rag_summary` and `ragas_scores` to `null` on **all** `ai_results` rows for the session (not just the edited eye), because the report describes both eyes.
-- `POST /ai/summarise-rag-crew?screening_session_id=` — generates full RAG clinical report via a CrewAI two-agent pipeline. Agent 1 (Clinical Evidence Researcher, gpt-4o-mini) uses severity_classifier and guideline_retrieval tools to fetch and condense Malaysian ophthalmology guidelines. Agent 2 (Clinical Report Writer, gpt-4o) uses patient_context, screening_history, diagnostic_assembler, doctor_lookup, and report_persist tools to write and persist a six-section structured markdown report. Returns `{rag_summary, references}`. On exception returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:**"`.
+- `POST /ai/summarise-rag-crew?screening_session_id=` — generates full RAG clinical report via the CrewAI two-agent pipeline in `backend/agents/`. Agent 1 (Clinical Evidence Researcher, gpt-4o-mini) uses `severity_classifier` and `guideline_retrieval` tools to fetch and condense Malaysian ophthalmology guidelines. Agent 2 (Clinical Report Writer, gpt-4o) uses `patient_context`, `screening_history`, `diagnostic_assembler`, `doctor_lookup`, and `report_persist` tools to write and persist a six-section structured markdown report. Returns `{rag_summary, references}` (references are scraped from `.pdf` mentions in the final report). On exception returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:**"`. **No-DR bypass**: if every eye in the session is classified as `'none'` (and no doctor override raised it), the CrewAI pipeline is skipped entirely and the fixed `NORMAL_SCREENING_TEMPLATE` is persisted and returned — saves tokens and avoids retrieving guidelines for "absence of disease".
+- `POST /ai/summarise-rag` — **DISABLED**. The original single-pipeline RAG endpoint has been commented out in `ai.py` (kept in source as a triple-quoted block for reference and possible future comparison). Superseded by `/summarise-rag-crew`. The `aiAPI.summariseRAG()` function still exists in `api.ts` but calling it will 404.
 - `GET /ai/rag-summary/{id}` — returns persisted rag_summary field from the first ai_results row for the session
-- `PATCH /ai/rag-summary/{session_id}` — updates `rag_summary` on **all** `ai_results` rows for the session with the provided string. Accepts `{rag_summary: string}`. Used by the doctor report inline editor to persist manual edits. Returns `{ok: true, message: "RAG summary updated"}`.
-- `POST /ai/evaluate-rag/{screening_session_id}` — evaluates an existing RAG summary using RAGAS metrics (faithfulness, answer_relevancy, and context_relevancy/context_utilization/ContextRelevance — selected via try/except at import time depending on the installed RAGAS version, see `_context_metric_name` log line). Re-runs retrieval to build the evaluation dataset. Best-effort persists scores to `ai_results.ragas_scores`. Returns `{ok, session_id, condition, scores}`. Reads severity defensively. **Not currently called by the frontend** — used via direct HTTP for FYP evaluation.
-- `GET /ai/rag-trace/{screening_session_id}` — read-only debug endpoint (no LLM calls, no DB writes) that re-runs only the RAG retrieval step. Returns `{session_id, condition, search_query, num_retrieved, retrieved_chunks: [{source, similarity, content_preview}], final_report}`. Used for FYP evaluation. ⚠️ Reads `result['dr_severity']` directly without the defensive `or severity_label` fallback (will raise `AttributeError: 'NoneType' object has no attribute 'lower'` on doctor-overridden rows). Not called by the frontend.
+- `PATCH /ai/rag-summary/{session_id}` — updates `rag_summary` on **all** `ai_results` rows for the session with the provided string. Accepts `{rag_summary: string}`. Used by the doctor report TipTap editor to persist manual edits. Returns `{ok: true, message: "RAG summary updated"}`.
+- `POST /ai/evaluate-rag/{screening_session_id}` — evaluates an existing RAG summary using RAGAS metrics (faithfulness, answer_relevancy, and `ContextUtilization`/`ContextRelevance`/`context_precision` — chosen via a try/except fallback chain at lazy-import time). RAGAS imports are **deferred until first call** (`_ragas_loaded` flag) so module import stays fast and avoids loading `datasets`/`ragas` unless this endpoint is hit. Re-runs retrieval to build the evaluation dataset. Best-effort persists scores to `ai_results.ragas_scores`. Returns `{ok, session_id, condition, scores}`. Reads severity defensively. **Not currently called by the frontend** — used via direct HTTP for FYP evaluation. Generated FYP trace files (`trace_*.json`) live at the project root.
+- `GET /ai/rag-trace/{screening_session_id}` — read-only debug endpoint (no LLM calls, no DB writes) that re-runs only the RAG retrieval step. Returns `{session_id, condition, search_query, num_retrieved, retrieved_chunks: [{source, similarity, content_preview}], final_report}`. Used for FYP evaluation. Reads severity defensively via the `dr_severity or severity_label or 'none'` fallback (safe on doctor-overridden rows). Not called by the frontend.
 - `GET /ai/health` — model load status + device + classes
 - `POST /ai/ingest-research?bucket_name=guidelines` — one-time ingestion of PDFs into vector store. `bucket_name` query param defaults to `"guidelines"`. Splits with chunk_size=1000, overlap=200.
+
+### `backend/agents/` — CrewAI multi-agent RAG pipeline
+Two-agent sequential crew kicked off by `/ai/summarise-rag-crew`.
+
+- **`llms.py`** — `researcher_llm` (gpt-4o-mini, temperature=0.1, max_tokens=1000) and `writer_llm` (gpt-4o, temperature=0.3, max_tokens=4000). Each agent owns its own LLM so hyperparams can be tuned independently.
+- **`crew.py`** — `run_clinical_report_crew(screening_session_id)` builds both tasks and runs `Crew(process=Process.sequential).kickoff()`. The Writer's task receives the Researcher's brief via task `context=[research_task]`.
+- **`agents/researcher.py`** — Clinical Evidence Researcher. Tools: `severity_classifier`, `guideline_retrieval`. Goal: produce an evidence brief (referral timeline, management steps, urgent triggers, follow-up intervals) plus a sources list.
+- **`agents/writer.py`** — Clinical Report Writer. Tools: `patient_context`, `screening_history`, `diagnostic_assembler`, `doctor_lookup`, `report_persist`. Produces the six-section markdown report, persists via `report_persist`, then returns ONLY the markdown as its final answer (no JSON wrapping, no fences). The `summarise-rag-crew` endpoint defensively strips ```` ```markdown ```` fences and `"Final Answer:"` prefixes anyway.
+- **`tools/severity_classifier.py`** — picks worst-case condition from `ai_results` rows (defensive `dr_severity or severity_label or 'none'`), builds the `search_query` ("management and referral guidelines for X Malaysia" for cataract/glaucoma, "...for X diabetic retinopathy Malaysia" for DR levels).
+- **`tools/guideline_retrieval.py`** — embeds the search query via `text-embedding-3-small` and calls the `match_documents` Supabase RPC (threshold=0.45, count=5). Returns `{retrieved_docs, sources, note?}`.
+- **`tools/patient_context.py`** — reads patient demographics + risk factors. Uses correct column names `glaucoma_family_history` / `elevated_iop_history` (this is where the old "always Unknown" bug was fixed).
+- **`tools/screening_history.py`** — fetches prior session severities for trend detection (accepts `exclude_session_id`).
+- **`tools/diagnostic_assembler.py`** — formats per-eye AI/doctor diagnosis. Suppresses confidence figures for doctor-confirmed eyes.
+- **`tools/doctor_lookup.py`** — returns the assigned doctor's name for the report header.
+- **`tools/report_persist.py`** — writes the final markdown to `ai_results.rag_summary` for **all** rows of the session.
 
 ### `staff.py` — `/staff`
 - `GET /staff/doctors` — lists staff_users with role=doctor (for nurse dropdown)
@@ -299,39 +334,50 @@ Routes are in `App.tsx`. `ProtectedRoute` redirects unauthenticated users to `/l
 | `/doctor/*` | DoctorDashboard | doctor |
 | `/admin/*` | AdminDashboard | admin |
 
-### NurseDashboard — 5 sub-views (`NurseView` discriminated union)
+### NurseDashboard — 6 sub-views (`NurseView` discriminated union)
 1. **home** — search patients by name or IC/passport (default landing view)
 2. **new-patient** — register a new patient
 3. **workspace** — select patient, view/create screening sessions
 4. **session** — upload L/R images, trigger AI, assign to doctor, delete pending session
 5. **appointments** — calendar view (month/week/day toggle) of appointments scheduled by this nurse, plus booking flow
+6. **all-patients** — full registered-patient table (Name, IC/Passport, Sessions) with its own search bar (name OR IC, case-insensitive). Reached via the "See more patients →" link in the sidebar; back returns to `home`. Clicking a patient name navigates to that patient's `workspace`. The Sessions column currently renders `"—"` with a `// TODO: requires session count endpoint` comment — no per-patient session count endpoint exists yet.
 
-Sidebar patient list shows patient name only (IC line removed). Required fields (Full Name, IC/Passport Number, Sex) show a red asterisk via `<span className="text-red-500">*</span>` in their labels.
+Sidebar patient list shows patient name only (IC line removed). Required fields (Full Name, IC/Passport Number, Sex) show a red asterisk via `<span className="text-red-500">*</span>` in their labels. The sidebar now shows the **top 5 patients** ordered by patient `created_at` DESC (proxy for most-recent registration activity) when the search box is empty; when the user types, the filter expands to the full `allPatients` list (client-side `includes` on name or IC). `allPatients` is fetched once via `patientsAPI.search(undefined, 200)` on mount and refetched when `patientListKey` changes (e.g. after a new patient is registered). A "See more patients →" link below the list opens the `all-patients` sub-view; the link is hidden only when there are zero patients.
 
-### DoctorDashboard — 3 sub-views (`DoctorView` discriminated union)
-1. **inbox** — list sessions assigned to the logged-in doctor. Status filter options: `all | assigned | approved | overridden` ('pending' excluded — doctors only see sessions that have been assigned to them). Table column header is "Session No." (not "No.").
-2. **review** — AI Verdict section with original/heatmap toggle (EyePanel), per-eye edit widgets, RAG report, and Approve or Submit button. Raw retinal images are **not** shown as a separate section — they are accessible only via the heatmap toggle within AI Verdict. The old Override modal has been removed.
-3. **appointments** — calendar view of appointments assigned to this doctor
+### DoctorDashboard — 5 sub-views (`DoctorView` discriminated union)
+1. **inbox** — list sessions assigned to the logged-in doctor. Status filter options: `all | assigned | approved | overridden` ('pending' excluded — doctors only see sessions that have been assigned to them). Table column header is "Session No." (not "No."). Top-right of the inbox header has a **Clear** button (eraser icon, `bg-red-500 text-white`; disabled state: `bg-gray-200 text-gray-400 opacity-60 cursor-not-allowed`) next to the refresh button — opens a confirmation modal and hides all currently-visible approved/overridden sessions from the inbox view only (frontend-only, no DB writes). Disabled when there are zero clearable sessions in the current visible list.
+2. **patient-history** — opened by clicking a patient in the sidebar. Title "{patient_name} — Screening History"; same table layout, status filter pills, and refresh button as the inbox, but **no Clear button** and the cleared-IDs filter is deliberately **not** applied here (this view is the way to access cleared sessions). Filters `assignedSessions` to only those whose `patient_id === selectedPatientId`.
+3. **all-patients** — full table (Name, IC/Passport, Sessions) of patients with ≥1 session assigned to this doctor. Reached via the "See more patients →" link in the sidebar; back returns to inbox. Clicking a patient name navigates to `patient-history` for that patient. The Sessions column is the count of that doctor's `assignedSessions` per patient (computed locally from the in-memory list, no extra API call). IC/Passport is resolved from a `patientIcMap` populated once on mount via `patientsAPI.search(undefined, 200)` — sessions to-the-doctor don't carry `ic_passport`, so this auxiliary lookup is required.
+4. **review** — AI Verdict section with original/heatmap toggle (EyePanel), per-eye edit widgets, RAG report, and Approve or Submit button. Raw retinal images are **not** shown as a separate section — they are accessible only via the heatmap toggle within AI Verdict. The old Override modal has been removed.
+5. **appointments** — calendar view of appointments assigned to this doctor
+
+**Clear button — localStorage persistence**: cleared session IDs are stored under `visionary_doctor_cleared_{doctor_id}` (per-doctor). State is loaded into a `Set<string>` on mount and persisted on every change. On each `assignedSessions` refresh the cleared list is pruned of any IDs no longer present (e.g. session reassigned away). The list is intentionally never cleared on logout — closing/clearing localStorage is the only reset path.
+
+**Return-to-origin after approve/override**: the `review` variant of `DoctorView` carries a `returnTo` field set when the user navigates in (`{ kind: 'inbox' }` from the inbox or `{ kind: 'patient-history', patient_id, patient_name }` from a patient-history view). After a successful Approve/Submit (or via the header back button), `handleReviewBack` reads `returnTo` and navigates accordingly. The header back button always shows **← Back** (label is no longer dynamic — navigation target is correct regardless).
 
 **Per-eye inline edit flow** (replaces the old Override button):
-- Each eye widget has an **Edit** button (visible when session is not locked).
+- Each eye widget has an **Edit** button (visible when session is not locked, but **disabled/greyed-out until a RAG report has been generated** — tooltip: "Generate Clinical Report Summary first"). The button uses a red/orange gradient style; when disabled it is `opacity-40 grayscale cursor-not-allowed`.
 - Clicking Edit switches the widget into a 3-field form: Disease Detected, Disease Type, Severity. Severity options are driven by `getSeverityOptions(diseaseType, diseaseDetected)`.
 - Clicking **Confirm** opens a custom `showOverrideConfirm` modal. On confirmation, calls `PATCH /ai/result/{id}`, updates local `aiResults` state, and collapses the widget to a post-edit summary with a "Doctor Edited" amber badge. Also clears `ragResult` locally (set to `null`) and shows a toast "Clinical summary cleared — click Regenerate to update it". The RAG section then shows a yellow "Needs Regeneration" card with a "Regenerate Clinical Summary" button instead of the previous report.
 - When at least one eye has been edited, the **Approve** button is replaced by a **Submit** button. Submit calls `POST /screenings/{id}/doctor-review` with `decision=overridden` and a fixed override reason.
 - All edit state (`leftEditing`, `rightEditing`, `leftEdited`, `rightEdited`, `leftEditForm`, `rightEditForm`, `leftConfirmed`, `rightConfirmed`, `showOverrideConfirm`, `pendingConfirmEye`) resets when the doctor navigates to a different session.
 
-**RAG report inline edit flow**:
+**RAG report inline edit flow** (TipTap WYSIWYG):
 - The AI Clinical Summary header shows an **Edit** button (red/orange gradient, same style as widget Edit buttons) when `ragResult` exists, the session is not locked, and `isEditingReport === false`.
-- Clicking Edit enters edit mode: the report is split into segments via `segmentMarkdown(rag_summary)`. Non-editable segments (headings starting with `#`, `---` rules, lines whose trimmed form starts with `**`, blank lines) each become their own read-only `ReactMarkdown` block. Consecutive editable lines are grouped into a single `<textarea>` that auto-sizes to its content.
+- Clicking Edit enters edit mode by mounting `<RagReportEditor>` (`src/components/RagReportEditor.tsx`) — a TipTap editor with `StarterKit` + the `tiptap-markdown` extension. The editor parses the current `rag_summary` as markdown on mount and exposes `getMarkdown()` via a `forwardRef` handle so the parent can pull serialized markdown back out. Toolbar buttons cover H3 / Bold / Italic / Bullet / Numbered list / Undo / Redo. The editor surface is styled (h3 17px medium, bold labels, tight lists) to match the view-mode markdown layout.
 - Clicking **Cancel** exits edit mode without saving; the Edit button reappears.
-- Clicking **Confirm** opens a `showSaveReportConfirm` modal. On confirmation, reassembles segments via `.map(s => s.text).join('\n')`, calls `PATCH /ai/rag-summary/{session_id}`, and updates local `ragResult`.
-- Edit state (`isEditingReport`, `editedSegments`, `showSaveReportConfirm`) resets when the doctor navigates to a different session.
+- Clicking **Confirm** opens a `showSaveReportConfirm` modal. On confirmation, reads markdown via `reportEditorRef.current?.getMarkdown()`, calls `PATCH /ai/rag-summary/{session_id}` via `aiAPI.updateRagSummary`, and updates local `ragResult`.
+- Edit state (`isEditingReport`, `showSaveReportConfirm`, `reportEditorRef`) resets when the doctor navigates to a different session. The `<RagReportEditor key={sessionId} />` key forces a fresh editor instance per session so its content reflects the new report.
 
-Sidebar session list shows patient name + session number only (Status line removed). Refresh button next to ← Back to Inbox has been removed.
+**Inbox row helpers** — `extractPatientName(s)` and `extractAssignedByName(s)` (top of `DoctorDashboard.tsx`) read patient/nurse names defensively from either the nested Supabase join shape (`s.patients?.name`, `s.created_by_user?.name`) or the flat enriched-API shape (`patient_name`, `assigned_by_name`). Use these instead of accessing the raw fields directly.
+
+Sidebar shows a **patient list** (not sessions): unique patients derived from `assignedSessions` via `useMemo` using `extractPatientName(s)` for the name and a defensive `patient_id` read (flat or nested-join), sorted by **most-recent `session_date` DESC** and **sliced to the top 5** when the search input is empty. Typing in the search expands matching to the full `patients` list (client-side `includes` on name). A "See more patients →" link below the list opens the `all-patients` sub-view; the link is hidden only when there are zero patients. Clicking a patient sets the view to `patient-history` for that patient. Each patient row uses the same className as the nurse sidebar patient items: `"w-full text-left px-3 py-2 rounded-xl text-sm text-gray-900 cursor-pointer"` with inline `style` for background/color/fontWeight (active: `#dbeafe`/`#1d4ed8`/600; default: `#f9fafb`/`#111827`/400) and `onMouseEnter`/`onMouseLeave` for hover — no Tailwind transition or scale utilities. Empty states: "No patients yet. Sessions will appear here once nurses assign them to you." (no patients at all) and "No patients match your search." (search yielded nothing). The **My Schedule** (appointments) sidebar nav item matches the nurse "Appointments" item exactly: wrapper div `px-3 py-2` with `borderBottom: '1px solid #f3f4f6'`; button `className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm font-semibold transition-all duration-150 cursor-pointer hover:shadow-sm"` with inline style for active (`#dbeafe`/`#1d4ed8`) vs default (`transparent`/`#374151`) and `onMouseEnter`/`onMouseLeave` hover.
 
 ### AdminDashboard — 2 tabs (internal values: `users`, `patients`)
-1. **users** ("Staff Users") — list, rename, reset password, delete staff accounts
-2. **patients** — list, update (name/IC/contact), delete patient records
+1. **users** ("Manage System Users") — list, rename, reset password, delete staff accounts
+2. **patients** ("Manage Patients") — list, update (name/IC/contact), delete patient records
+
+The top bar uses the shared `<AppHeader>` with a red `Shield` icon in `leftSlot` and `{user.name} + Sign Out` in `rightSlot` (the "Admin" role badge that used to sit there was removed). Tab buttons live in their own row below the header. The old blue "Email + Role are read-only (HR-controlled)" info banner above the System Users table was removed. Both tables paginate at 10/page via the shared `<Pagination>` component (see Important Conventions); each tab's state resets to page 1 naturally because the inactive tab is unmounted via conditional rendering.
 
 ---
 
@@ -381,10 +427,10 @@ After `PATCH /ai/result/{id}`, the `dr_severity` column is set to `null`. Any ba
 ```python
 severity = result.get('dr_severity') or result.get('severity_label') or 'none'
 ```
-This applies in `generate_rag_summary` and `evaluate_rag` in `ai.py` (already fixed). **`rag_trace` (`GET /ai/rag-trace/{id}`) is NOT yet fixed** — it reads `result['dr_severity']` directly (`ai.py:1120`) and will crash on overridden rows. Apply the defensive pattern to any future code that reads `dr_severity` from `ai_results` rows.
+This pattern is in place in `evaluate_rag`, `rag_trace`, `_is_no_dr_session`, the CrewAI `severity_classifier` tool, and the (now-disabled) `generate_rag_summary`. Apply the same defensive pattern to any future code that reads `dr_severity` from `ai_results` rows.
 
 ### Glaucoma/IOP column names — RAG reads wrong columns — FIXED
-This bug is now **FIXED**. Previously `generate_rag_summary` read the glaucoma/IOP patient fields under the wrong column names (`family_history_glaucoma` / `elevated_iop`), so the RAG report always showed "Unknown" for them. The CrewAI crew pipeline's `patient_context` tool now correctly reads `glaucoma_family_history` and `elevated_iop_history` from the `patients` table.
+This bug is now **FIXED** in both pipelines. Previously the original `generate_rag_summary` read the glaucoma/IOP patient fields under the wrong column names (`family_history_glaucoma` / `elevated_iop`), so the RAG report always showed "Unknown" for them. The CrewAI `patient_context` tool (`backend/agents/tools/patient_context.py`) now correctly reads `glaucoma_family_history` and `elevated_iop_history` from the `patients` table.
 
 ### `RetinalImage.created_at` vs `uploaded_at`
 The `retinal_images` table column is `uploaded_at` (set in `uploads.py:82`). The TypeScript `RetinalImage` interface declares `created_at: string` instead. Read defensively if you need the timestamp from this row.
@@ -392,7 +438,9 @@ The `retinal_images` table column is `uploaded_at` (set in `uploads.py:82`). The
 ### Frontend coverage gaps
 - `aiAPI` does **not** expose `/ai/evaluate-rag` or `/ai/rag-trace` — these are backend-only / FYP-evaluation endpoints called via direct HTTP (e.g. curl or test scripts), not from the React app.
 - `aiAPI` **does** expose `reanalyze(sessionId)` — calls `POST /ai/reanalyze/{id}`. It exists in `api.ts` but is not triggered from the nurse/doctor UI (admin/debug only).
-- `aiAPI` exposes `updateRagSummary(sessionId, ragSummary)` — calls `PATCH /ai/rag-summary/{id}`, used by the doctor report inline editor.
+- `aiAPI.summariseRAGCrew(sessionId)` — calls `POST /ai/summarise-rag-crew`, the **live** RAG endpoint used by the doctor review screen.
+- `aiAPI.summariseRAG(sessionId)` — still exported, but the backing endpoint `/ai/summarise-rag` is disabled (commented out in `ai.py`). Calling it will 404. Use `summariseRAGCrew` instead.
+- `aiAPI.updateRagSummary(sessionId, ragSummary)` — calls `PATCH /ai/rag-summary/{id}`, used by the doctor TipTap report editor.
 
 ---
 
@@ -416,7 +464,7 @@ All backend responses follow one of two shapes:
 ```
 Exceptions to the wrapper pattern:
 - **Appointments** endpoints return the appointment object directly (`AppointmentOut` model). `POST /appointments` returns HTTP 201.
-- **`POST /ai/summarise-rag-crew`** returns `{rag_summary, references}` (no `ok`). On internal exceptions, returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:** "`.
+- **`POST /ai/summarise-rag-crew`** returns `{rag_summary, references}` (no `ok`). On internal exceptions, returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:** "`. For No-DR sessions, returns the fixed `NORMAL_SCREENING_TEMPLATE` with empty references and bypasses CrewAI entirely.
 - **`GET /ai/rag-summary/{id}`** returns `{rag_summary: string | null}` (no `ok`).
 - **`PATCH /ai/rag-summary/{id}`** returns `{ok: true, message: "RAG summary updated"}`.
 - **`POST /screenings/{id}/send-report`** returns `{success: true}`.
@@ -437,3 +485,5 @@ Exceptions to the wrapper pattern:
 - **No file-based frontend build step needed in dev** — `npm run dev` serves the React app directly via Vite.
 - **Tailwind CSS** is used throughout the frontend (dark theme, `bg-[#0b0f14]` is the base background color).
 - **react-hot-toast** is used for all notifications (top-right, 4s, dark styled).
+- **Long-list pagination** — Lists that can exceed 15 items use the shared `<Pagination>` component (`src/components/Pagination.tsx`). It renders only when `totalItems > 15`, shows 15 per page, includes Prev/Next arrows + numbered pages with ellipsis compression beyond 7 pages, and smooth-scrolls to the table top on page change. Currently applied to: Doctor Inbox, Doctor Patient History, Doctor All Patients, Nurse All Patients, Nurse Workspace screening sessions (all 15/page), and Admin System Users + Admin All Patients (10/page).
+- **App header with home shortcut** — All three dashboards render an `<AppHeader>` component (`src/components/AppHeader.tsx`) at the top of their main content area. It contains a "Visionary AI" logo (inline SVG eye + wordmark) that, when clicked, returns the user to their dashboard's home view (Nurse → `home`, Doctor → `inbox`, Admin → `users`). The component accepts optional `leftSlot` and `rightSlot` props so dashboards can host the hamburger toggle and contextual back buttons (left) and user/sign-out controls (right) inside the same bar. On DoctorDashboard, if the TipTap RAG editor has unsaved changes (`isEditingReport === true`), clicking the logo opens a confirmation modal (`showLogoLeaveConfirm`) before navigating; per-eye edits and other in-progress states do not trigger this guard. `isEditingReport` is lifted to the `DoctorDashboard` level (controlled prop into `ReviewView`) so the logo handler can read it.
