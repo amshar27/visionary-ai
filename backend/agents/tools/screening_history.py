@@ -12,27 +12,50 @@ logger = logging.getLogger(__name__)
 
 
 class ScreeningHistoryInput(BaseModel):
-    patient_id: str = Field(..., description="UUID of the patient")
-    exclude_session_id: str = Field(
-        ..., description="UUID of the current session to exclude from history"
+    screening_session_id: str = Field(
+        ...,
+        description="UUID of the current screening session. The tool resolves "
+        "the patient_id internally and excludes this session from history.",
     )
 
 
 class ScreeningHistoryTool(BaseTool):
     name: str = "screening_history"
     description: str = (
-        "Fetches up to 3 most-recent prior screening sessions for a patient "
-        "(excluding the current one) and returns their per-eye severities as a "
-        "markdown bullet string."
+        "Fetches up to 3 most-recent prior screening sessions for the patient "
+        "behind the given screening_session_id (excluding the current session) "
+        "and returns their per-eye severities as a markdown bullet string."
     )
     args_schema: Type[BaseModel] = ScreeningHistoryInput
 
-    def _run(self, patient_id: str, exclude_session_id: str) -> dict:
+    def _run(self, screening_session_id: str) -> dict:
+        logger.info(
+            "[screening_history] called with screening_session_id=%r",
+            screening_session_id,
+        )
+
+        session_row = (
+            supabase.table("screening_sessions")
+            .select("patient_id")
+            .eq("id", screening_session_id)
+            .single()
+            .execute()
+        )
+        patient_id = (session_row.data or {}).get("patient_id")
+        logger.info(
+            "[screening_history] resolved patient_id=%r for session=%r",
+            patient_id,
+            screening_session_id,
+        )
+
+        if not patient_id:
+            return {"past_history": "No previous screening records found."}
+
         past = (
             supabase.table("screening_sessions")
             .select("id, session_date")
             .eq("patient_id", patient_id)
-            .neq("id", exclude_session_id)
+            .neq("id", screening_session_id)
             .order("session_date", desc=True)
             .limit(3)
             .execute()
