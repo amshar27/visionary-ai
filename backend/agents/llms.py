@@ -17,3 +17,10 @@ writer_llm = LLM(
     max_tokens=4000,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
+
+critic_llm = LLM(
+    model="gpt-4o-mini",
+    temperature=0.0,
+    max_tokens=500,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)

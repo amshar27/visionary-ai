@@ -1027,28 +1027,12 @@ def generate_rag_summary_crew(screening_session_id: UUID):
 
         from backend.agents.crew import run_clinical_report_crew
 
+        # The four-agent crew already strips fences / "Final Answer:" prefixes
+        # and extracts .pdf references internally, and returns a dict.
         result = run_clinical_report_crew(str(screening_session_id))
 
-        raw = result.raw if hasattr(result, "raw") else str(result)
-
-        # Defensive cleanup: the Writer agent's contract is plain markdown,
-        # but agents occasionally wrap output in code fences or prefix with
-        # "Final Answer:" despite explicit instructions otherwise.
-        cleaned = raw.strip()
-        cleaned = re.sub(r"^```(?:markdown|md)?\s*\n?", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-        cleaned = re.sub(r"^(final answer|answer)\s*:\s*\n?", "", cleaned, flags=re.IGNORECASE)
-        cleaned = cleaned.strip()
-
-        # Derive references by scanning the report itself for .pdf mentions.
-        # The Researcher's brief feeds source filenames into the Writer's
-        # context, so they typically surface in the Recommended Management
-        # section or inline citations.
-        references = []
-        try:
-            references = sorted(set(re.findall(r"[\w\-\.]+\.pdf", cleaned)))
-        except Exception:
-            pass
+        cleaned = (result.get("rag_summary") or "").strip()
+        references = result.get("references") or []
 
         return {"rag_summary": cleaned, "references": references}
 

@@ -18,7 +18,7 @@ Clinical-grade eye disease screening system built as a Final Year Project for Ma
 | LLM (RAG reports) | OpenAI `gpt-4o` |
 | RAG pipeline | LangChain + OpenAI embeddings (`text-embedding-3-small`) + Supabase vector store |
 | RAG evaluation | RAGAS (`ragas` + HuggingFace `datasets`) — faithfulness, answer_relevancy, context_utilization (lazy-imported) |
-| Multi-Agent Pipeline | CrewAI — two-agent crew (Researcher: gpt-4o-mini, Writer: gpt-4o) — see `backend/agents/` |
+| Multi-Agent Pipeline | CrewAI — four-agent crew (Researcher: gpt-4o-mini, Brief Critic: gpt-4o-mini, Writer: gpt-4o, Report Critic: gpt-4o-mini) with conditional revision loop — see `backend/agents/` |
 | Rich-text editor | TipTap (`@tiptap/react`, `@tiptap/starter-kit`, `tiptap-markdown`) — WYSIWYG editing of RAG reports |
 | Auth | Custom bcrypt — no JWT; user object stored in `localStorage` |
 | Email | Resend (`RESEND_API_KEY`) |
@@ -79,15 +79,20 @@ visionary_ai/
 │   ├── notification_service.py   # Resend email: confirmation, reminder, clinical report, OTP
 │   ├── scheduler.py              # APScheduler: send_reminders + auto_no_show (every 1 min)
 │   ├── requirements.txt          # backend-specific deps
-│   ├── agents/                   # CrewAI multi-agent RAG pipeline
-│   │   ├── crew.py               # run_clinical_report_crew() — assembles + kicks off the crew
-│   │   ├── llms.py               # researcher_llm (gpt-4o-mini), writer_llm (gpt-4o)
+│   ├── agents/                   # CrewAI multi-agent RAG pipeline (four agents, 3-phase)
+│   │   ├── crew.py               # run_clinical_report_crew() — assembles + runs 3-phase pipeline (returns dict)
+│   │   ├── llms.py               # researcher_llm (gpt-4o-mini), writer_llm (gpt-4o), critic_llm (gpt-4o-mini, temp=0)
 │   │   ├── agents/
-│   │   │   ├── researcher.py     # Clinical Evidence Researcher agent
-│   │   │   └── writer.py         # Clinical Report Writer agent
+│   │   │   ├── researcher.py     # Agent 1 — Clinical Evidence Researcher
+│   │   │   ├── brief_critic.py   # Agent 2 — Clinical Evidence Auditor (no tools, JSON verdict only)
+│   │   │   ├── writer.py         # Agent 3 — Clinical Report Writer
+│   │   │   └── report_critic.py  # Agent 4 — Clinical Report Quality Auditor (no tools, JSON verdict only)
 │   │   ├── tasks/
-│   │   │   ├── research_task.py  # Researcher's task — classify worst case + retrieve guidelines
-│   │   │   └── report_task.py    # Writer's task — six-section markdown report + persist
+│   │   │   ├── research_task.py        # Researcher's task — classify worst case + retrieve guidelines
+│   │   │   ├── brief_critique_task.py  # Brief Critic's task — rubric audit of Researcher's brief
+│   │   │   ├── report_task.py          # Writer's task — six-section markdown report + persist
+│   │   │   ├── report_critique_task.py # Report Critic's task — rubric audit of Writer's report
+│   │   │   └── report_revision_task.py # Writer's revision task — fix only flagged issues
 │   │   └── tools/                # CrewAI BaseTool subclasses
 │   │       ├── severity_classifier.py   # picks worst-case condition + builds search_query
 │   │       ├── guideline_retrieval.py   # match_documents RPC, top-5 chunks
@@ -174,7 +179,7 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use. Not currently called by the frontend.
 - `GET /ai/results/by-session/{id}` — returns ai_results rows for session
 - `PATCH /ai/result/{ai_result_id}` — doctor inline override for a single eye. Accepts `{disease_detected, disease_type, severity_label}`. Nulls out `dr_severity`, `referable`, `confidence_score`, `follow_up_interval`, `llm_summary`, and sets `warnings` to `[]`. Does **not** accept `dr_severity` in the body (it's a DB enum; the endpoint sets it to null deliberately). After this PATCH, `disease_type` and `severity_label` are the only fields carrying the doctor's diagnosis. Also invalidates the session-wide RAG by setting `rag_summary` and `ragas_scores` to `null` on **all** `ai_results` rows for the session (not just the edited eye), because the report describes both eyes.
-- `POST /ai/summarise-rag-crew?screening_session_id=` — generates full RAG clinical report via the CrewAI two-agent pipeline in `backend/agents/`. Agent 1 (Clinical Evidence Researcher, gpt-4o-mini) uses `severity_classifier` and `guideline_retrieval` tools to fetch and condense Malaysian ophthalmology guidelines. Agent 2 (Clinical Report Writer, gpt-4o) uses `patient_context`, `screening_history`, `diagnostic_assembler`, `doctor_lookup`, and `report_persist` tools to write and persist a six-section structured markdown report. Returns `{rag_summary, references}` (references are scraped from `.pdf` mentions in the final report). On exception returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:**"`. **No-DR bypass**: if every eye in the session is classified as `'none'` (and no doctor override raised it), the CrewAI pipeline is skipped entirely and the fixed `NORMAL_SCREENING_TEMPLATE` is persisted and returned — saves tokens and avoids retrieving guidelines for "absence of disease".
+- `POST /ai/summarise-rag-crew?screening_session_id=` — generates full RAG clinical report via the CrewAI **four-agent** pipeline in `backend/agents/`. Phase 1 (sequential Crew): Agent 1 (Clinical Evidence Researcher, gpt-4o-mini) uses `severity_classifier` and `guideline_retrieval` to fetch and condense Malaysian ophthalmology guidelines; Agent 2 (Clinical Evidence Auditor / Brief Critic, gpt-4o-mini, temp=0) audits the brief and emits a JSON verdict (logged for observability, does not currently re-run the Researcher); Agent 3 (Clinical Report Writer, gpt-4o) uses `patient_context`, `screening_history`, `diagnostic_assembler`, `doctor_lookup`, and `report_persist` to write and persist a six-section structured markdown report. Phase 2: Agent 4 (Clinical Report Quality Auditor / Report Critic, gpt-4o-mini, temp=0) audits the draft and emits a JSON verdict. Phase 3 (conditional, only on `verdict=fail`): Writer re-runs `build_report_revision_task` to fix ONLY flagged sections and persists again via `report_persist`. The crew function returns `{rag_summary, references}` directly; the endpoint just reads those fields from the dict (fence-stripping and `.pdf` extraction happen inside the crew). On exception returns HTTP 200 with `rag_summary` prefixed by `"**Error generating report:**"`. **No-DR bypass**: if every eye in the session is classified as `'none'` (and no doctor override raised it), the CrewAI pipeline is skipped entirely and the fixed `NORMAL_SCREENING_TEMPLATE` is persisted and returned — saves tokens and avoids retrieving guidelines for "absence of disease". The same bypass is duplicated inside `crew.py` as defense-in-depth.
 - `POST /ai/summarise-rag` — **DISABLED**. The original single-pipeline RAG endpoint has been commented out in `ai.py` (kept in source as a triple-quoted block for reference and possible future comparison). Superseded by `/summarise-rag-crew`. The `aiAPI.summariseRAG()` function still exists in `api.ts` but calling it will 404.
 - `GET /ai/rag-summary/{id}` — returns persisted rag_summary field from the first ai_results row for the session
 - `PATCH /ai/rag-summary/{session_id}` — updates `rag_summary` on **all** `ai_results` rows for the session with the provided string. Accepts `{rag_summary: string}`. Used by the doctor report TipTap editor to persist manual edits. Returns `{ok: true, message: "RAG summary updated"}`.
@@ -184,12 +189,17 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `POST /ai/ingest-research?bucket_name=guidelines` — one-time ingestion of PDFs into vector store. `bucket_name` query param defaults to `"guidelines"`. Splits with chunk_size=1000, overlap=200.
 
 ### `backend/agents/` — CrewAI multi-agent RAG pipeline
-Two-agent sequential crew kicked off by `/ai/summarise-rag-crew`.
+Four-agent pipeline kicked off by `/ai/summarise-rag-crew`, organised into **three sequential Crews** so a conditional revision loop can run between them. Pipeline order: Researcher → Brief Critic → Writer (phase 1) → Report Critic (phase 2) → Writer revision (phase 3, only if Report Critic verdict is `fail`).
 
-- **`llms.py`** — `researcher_llm` (gpt-4o-mini, temperature=0.1, max_tokens=1000) and `writer_llm` (gpt-4o, temperature=0.3, max_tokens=4000). Each agent owns its own LLM so hyperparams can be tuned independently.
-- **`crew.py`** — `run_clinical_report_crew(screening_session_id)` builds both tasks and runs `Crew(process=Process.sequential).kickoff()`. The Writer's task receives the Researcher's brief via task `context=[research_task]`.
-- **`agents/researcher.py`** — Clinical Evidence Researcher. Tools: `severity_classifier`, `guideline_retrieval`. Goal: produce an evidence brief (referral timeline, management steps, urgent triggers, follow-up intervals) plus a sources list.
-- **`agents/writer.py`** — Clinical Report Writer. Tools: `patient_context`, `screening_history`, `diagnostic_assembler`, `doctor_lookup`, `report_persist`. Produces the six-section markdown report, persists via `report_persist`, then returns ONLY the markdown as its final answer (no JSON wrapping, no fences). The `summarise-rag-crew` endpoint defensively strips ```` ```markdown ```` fences and `"Final Answer:"` prefixes anyway.
+- **`llms.py`** — `researcher_llm` (gpt-4o-mini, temperature=0.1, max_tokens=1000), `writer_llm` (gpt-4o, temperature=0.3, max_tokens=4000), and `critic_llm` (gpt-4o-mini, **temperature=0.0**, max_tokens=500). Critics are deterministic — temperature=0 — because their verdicts gate the revision loop. Each agent owns its own LLM so hyperparams can be tuned independently.
+- **`crew.py`** — `run_clinical_report_crew(screening_session_id)` returns `{"rag_summary": str, "references": list[str]}` (NOT a CrewOutput). Internally runs three separate `Crew(process=Process.sequential)` instances. Between phase 1 and phase 2 it appends `brief_critique_task` to `report_task.context` at runtime (so the Writer sees the brief critique without modifying `report_task.py`). Phase 3 only runs if the Report Critic's parsed JSON verdict is `fail`; otherwise the original draft is used. Also includes a duplicated **No-DR bypass** (mirrors the same check in `ai.py`) as defense-in-depth, plus internal fence-stripping and `.pdf` reference extraction. Malformed critic JSON is treated as `pass` (logged) so a broken verdict can't block the pipeline.
+- **`agents/researcher.py`** — Agent 1, Clinical Evidence Researcher. Tools: `severity_classifier`, `guideline_retrieval`. Goal: produce an evidence brief (referral timeline, management steps, urgent triggers, follow-up intervals) plus a sources list.
+- **`agents/brief_critic.py`** — Agent 2, Clinical Evidence Auditor. **No tools.** Uses `critic_llm`. Receives the Researcher's brief via `context=[research_task]` and emits a raw JSON verdict `{verdict, failed_checks, revision_instruction}`. Rubric flags: `missing_referral_timeline`, `missing_management_steps`, `missing_urgent_triggers`, `retrieval_failed`, `severity_mismatch`. The verdict is **logged** but does not currently trigger a Researcher re-run — it informs the Writer (which sees it via the appended context) and provides observability.
+- **`agents/writer.py`** — Agent 3, Clinical Report Writer. Tools: `patient_context`, `screening_history`, `diagnostic_assembler`, `doctor_lookup`, `report_persist`. Produces the six-section markdown report, persists via `report_persist`, then returns ONLY the markdown as its final answer (no JSON wrapping, no fences). Both the crew and the `summarise-rag-crew` endpoint defensively strip ```` ```markdown ```` fences and `"Final Answer:"` prefixes anyway.
+- **`agents/report_critic.py`** — Agent 4, Clinical Report Quality Auditor. **No tools.** Uses `critic_llm`. Receives the Writer's draft via `context=[report_task]` and emits a raw JSON verdict `{verdict, failed_checks, revision_instruction}`. Rubric flags: `missing_section`, `no_risk_factor_linkage`, `followup_interval_mismatch`, `no_references_cited`, `generic_recommendations`. A `fail` verdict triggers phase 3.
+- **`tasks/brief_critique_task.py`** — `build_brief_critique_task(research_task)`. Context: `[research_task]`. Expected output: raw JSON verdict (no fences, no prose).
+- **`tasks/report_critique_task.py`** — `build_report_critique_task(report_task)`. Context: `[report_task]`. Expected output: raw JSON verdict.
+- **`tasks/report_revision_task.py`** — `build_report_revision_task(screening_session_id, report_task, report_critique_task)`. Context: `[report_task, report_critique_task]`. Instructs the Writer to fix ONLY the flagged sections, call `report_persist` again, and return plain markdown.
 - **`tools/severity_classifier.py`** — picks worst-case condition from `ai_results` rows (defensive `dr_severity or severity_label or 'none'`), builds the `search_query` ("management and referral guidelines for X Malaysia" for cataract/glaucoma, "...for X diabetic retinopathy Malaysia" for DR levels).
 - **`tools/guideline_retrieval.py`** — embeds the search query via `text-embedding-3-small` and calls the `match_documents` Supabase RPC (threshold=0.45, count=5). Returns `{retrieved_docs, sources, note?}`.
 - **`tools/patient_context.py`** — reads patient demographics + risk factors. Uses correct column names `glaucoma_family_history` / `elevated_iop_history` (this is where the old "always Unknown" bug was fixed).
