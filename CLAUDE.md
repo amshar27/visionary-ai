@@ -111,7 +111,10 @@ visionary_ai/
     │   │   └── AuthContext.tsx   # useAuth hook, localStorage session (key: visionary_user)
     │   ├── components/
     │   │   ├── ProtectedRoute.tsx  # role-based guard, redirects wrong-role to their home
-    │   │   └── RagReportEditor.tsx # TipTap WYSIWYG markdown editor for doctor RAG report editing
+    │   │   ├── RagReportEditor.tsx # TipTap WYSIWYG markdown editor for doctor RAG report editing
+    │   │   ├── AppHeader.tsx       # shared top bar: logo home-shortcut + leftSlot/rightSlot
+    │   │   ├── Pagination.tsx      # shared paginator (renders only when >15 items)
+    │   │   └── ViewNavArrows.tsx   # browser-style back/forward arrow row for in-app sub-view history
     │   ├── pages/
     │   │   ├── Landing.tsx       # dark hero, redirects logged-in users to role dashboard
     │   │   ├── Login.tsx         # email/password form + "Forgot password?" link
@@ -344,6 +347,15 @@ Routes are in `App.tsx`. `ProtectedRoute` redirects unauthenticated users to `/l
 | `/doctor/*` | DoctorDashboard | doctor |
 | `/admin/*` | AdminDashboard | admin |
 
+### Back/Forward sub-view navigation (`ViewNavArrows`)
+Both NurseDashboard and DoctorDashboard render a **browser-style back/forward arrow row** (`src/components/ViewNavArrows.tsx`) directly below `<AppHeader>`, on **every** sub-view (including Nurse `home` / Doctor `inbox`). It navigates the user's **in-app sub-view history**, independent of the router/browser history API.
+- Each dashboard's sub-view `useState` setter is renamed `applyView`; a wrapper `setView(next)` pushes the current view onto a `viewHistory` stack, clears `viewFuture`, then applies the new view. **All existing `setView(...)` call sites are unchanged** — they get history tracking automatically. `goBack`/`goForward` move views between the two stacks.
+- The row is rendered **once per dashboard** in a single fixed location (a `flex-none` sibling between `<AppHeader>` and `<main>`); it is **not** duplicated per sub-view. Arrows are bold blue `ArrowLeft`/`ArrowRight` lucide icons (`size={18}`, `strokeWidth={3}`), back-on-left/forward-on-right, in `w-8 h-7` buttons on a `px-6 py-0.5` container.
+- Back is disabled (faded `opacity-40 cursor-not-allowed`) when `viewHistory` is empty; forward when `viewFuture` is empty — so on home/inbox both arrows are usually disabled. Disabled buttons set the `disabled` attribute.
+- The old contextual in-header back buttons ("← Back to Patients", "← Back to Workspace", "← Back to Inbox", "← Back") were **removed** from both dashboards' `AppHeader` `leftSlot` (now only the hamburger toggle remains) since the arrow row supersedes them. The Nurse `returnTo` state and the Doctor `headerBackLabel` constant were removed as dead code; `handleReviewBack` is kept (still wired to `ReviewView`'s `onBack` and the approve/override return-to-origin flow).
+- Deeper sub-views (those other than home/inbox originally) use `px-6 pt-3 pb-6` instead of `p-6` to keep content tight under the arrow row; Nurse `home` and Doctor `inbox` retain `p-6`.
+- **Admin dashboard does NOT have the arrow row.**
+
 ### NurseDashboard — 6 sub-views (`NurseView` discriminated union)
 1. **home** — search patients by name or IC/passport (default landing view)
 2. **new-patient** — register a new patient
@@ -363,7 +375,7 @@ Sidebar patient list shows patient name only (IC line removed). Required fields 
 
 **Clear button — localStorage persistence**: cleared session IDs are stored under `visionary_doctor_cleared_{doctor_id}` (per-doctor). State is loaded into a `Set<string>` on mount and persisted on every change. On each `assignedSessions` refresh the cleared list is pruned of any IDs no longer present (e.g. session reassigned away). The list is intentionally never cleared on logout — closing/clearing localStorage is the only reset path.
 
-**Return-to-origin after approve/override**: the `review` variant of `DoctorView` carries a `returnTo` field set when the user navigates in (`{ kind: 'inbox' }` from the inbox or `{ kind: 'patient-history', patient_id, patient_name }` from a patient-history view). After a successful Approve/Submit (or via the header back button), `handleReviewBack` reads `returnTo` and navigates accordingly. The header back button always shows **← Back** (label is no longer dynamic — navigation target is correct regardless).
+**Return-to-origin after approve/override**: the `review` variant of `DoctorView` carries a `returnTo` field set when the user navigates in (`{ kind: 'inbox' }` from the inbox or `{ kind: 'patient-history', patient_id, patient_name }` from a patient-history view). After a successful Approve/Submit, `handleReviewBack` reads `returnTo` and navigates accordingly. (`handleReviewBack` is also passed to `ReviewView` as `onBack`. The old in-header "← Back" button was removed — see the Back/Forward sub-view navigation section above; the `ViewNavArrows` row now handles in-app back navigation.)
 
 **Per-eye inline edit flow** (replaces the old Override button):
 - Each eye widget has an **Edit** button (visible when session is not locked, but **disabled/greyed-out until a RAG report has been generated** — tooltip: "Generate Clinical Report Summary first"). The button uses a red/orange gradient style; when disabled it is `opacity-40 grayscale cursor-not-allowed`.
@@ -496,4 +508,4 @@ Exceptions to the wrapper pattern:
 - **Tailwind CSS** is used throughout the frontend (dark theme, `bg-[#0b0f14]` is the base background color).
 - **react-hot-toast** is used for all notifications (top-right, 4s, dark styled).
 - **Long-list pagination** — Lists that can exceed 15 items use the shared `<Pagination>` component (`src/components/Pagination.tsx`). It renders only when `totalItems > 15`, shows 15 per page, includes Prev/Next arrows + numbered pages with ellipsis compression beyond 7 pages, and smooth-scrolls to the table top on page change. Currently applied to: Doctor Inbox, Doctor Patient History, Doctor All Patients, Nurse All Patients, Nurse Workspace screening sessions (all 15/page), and Admin System Users + Admin All Patients (10/page).
-- **App header with home shortcut** — All three dashboards render an `<AppHeader>` component (`src/components/AppHeader.tsx`) at the top of their main content area. It contains a "Visionary AI" logo (inline SVG eye + wordmark) that, when clicked, returns the user to their dashboard's home view (Nurse → `home`, Doctor → `inbox`, Admin → `users`). The component accepts optional `leftSlot` and `rightSlot` props so dashboards can host the hamburger toggle and contextual back buttons (left) and user/sign-out controls (right) inside the same bar. On DoctorDashboard, if the TipTap RAG editor has unsaved changes (`isEditingReport === true`), clicking the logo opens a confirmation modal (`showLogoLeaveConfirm`) before navigating; per-eye edits and other in-progress states do not trigger this guard. `isEditingReport` is lifted to the `DoctorDashboard` level (controlled prop into `ReviewView`) so the logo handler can read it.
+- **App header with home shortcut** — All three dashboards render an `<AppHeader>` component (`src/components/AppHeader.tsx`) at the top of their main content area. It contains a "Visionary AI" logo (inline SVG eye + wordmark) that, when clicked, returns the user to their dashboard's home view (Nurse → `home`, Doctor → `inbox`, Admin → `users`). The component accepts optional `leftSlot` and `rightSlot` props so dashboards can host the hamburger toggle (left) and user/sign-out controls (right) inside the same bar. (The contextual "← Back to …" buttons that used to live in `leftSlot` were removed — in-app back navigation is now handled by the `ViewNavArrows` row rendered below the header; see the Back/Forward sub-view navigation section.) On DoctorDashboard, if the TipTap RAG editor has unsaved changes (`isEditingReport === true`), clicking the logo opens a confirmation modal (`showLogoLeaveConfirm`) before navigating; per-eye edits and other in-progress states do not trigger this guard. `isEditingReport` is lifted to the `DoctorDashboard` level (controlled prop into `ReviewView`) so the logo handler can read it.

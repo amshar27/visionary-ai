@@ -11,6 +11,7 @@ import type { User } from '../types';
 import RagReportEditor, { type RagReportEditorHandle } from '../components/RagReportEditor';
 import Pagination from '../components/Pagination';
 import AppHeader from '../components/AppHeader';
+import ViewNavArrows from '../components/ViewNavArrows';
 
 const PAGE_SIZE = 15;
 
@@ -395,7 +396,7 @@ function PatientHistoryView({
   const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-1">
         <h2 className="text-2xl font-bold text-gray-900">{patientName} — Screening History</h2>
         <button onClick={load} className="p-2 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#f3f4f6' }}>
@@ -738,7 +739,7 @@ function ReviewView({
   const patientEmail = (session as any)?.patients?.email as string | null;
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-5xl mx-auto">
       <h2 className="text-2xl font-bold text-gray-900 mt-1">Doctor Review</h2>
       <p className="text-xs mb-2 text-gray-400">Session ID: {sessionId.slice(0, 8)}…</p>
 
@@ -1199,7 +1200,7 @@ function DoctorAppointmentsView({ doctorId }: { doctorId: string }) {
   };
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-5xl mx-auto">
       <div className="mb-4"><h2 className="text-2xl font-bold text-gray-900">My Schedule</h2></div>
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-1">
@@ -1284,7 +1285,7 @@ function AllPatientsDoctorView({
   const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-5xl mx-auto">
       <h2 className="text-2xl font-bold text-gray-900 mb-1">All Patients</h2>
       <p className="text-sm mb-4 text-gray-500">Patients with sessions assigned to you.</p>
 
@@ -1349,7 +1350,36 @@ function AllPatientsDoctorView({
 export default function DoctorDashboard() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
-  const [view, setView] = useState<DoctorView>({ name: 'inbox' });
+  const [view, applyView] = useState<DoctorView>({ name: 'inbox' });
+  // In-app sub-view history (browser-style back/forward), independent of the router.
+  const [viewHistory, setViewHistory] = useState<DoctorView[]>([]);
+  const [viewFuture, setViewFuture] = useState<DoctorView[]>([]);
+
+  // Centralized navigation: every normal sub-view change records history so the
+  // back/forward arrow row can replay it. Existing setView(...) call sites are
+  // unchanged — they route through this wrapper automatically.
+  const setView = (next: DoctorView) => {
+    setViewHistory(h => [...h, view]);
+    setViewFuture([]);
+    applyView(next);
+  };
+
+  const goBack = () => {
+    if (viewHistory.length === 0) return;
+    const prev = viewHistory[viewHistory.length - 1];
+    setViewHistory(h => h.slice(0, -1));
+    setViewFuture(f => [view, ...f]);
+    applyView(prev);
+  };
+
+  const goForward = () => {
+    if (viewFuture.length === 0) return;
+    const next = viewFuture[0];
+    setViewFuture(f => f.slice(1));
+    setViewHistory(h => [...h, view]);
+    applyView(next);
+  };
+
   const [reviewRefreshKey] = useState(0);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(260);
@@ -1459,8 +1489,6 @@ export default function DoctorDashboard() {
       setView({ name: 'inbox' });
     }
   };
-
-  const headerBackLabel = '← Back';
 
   const handleLogoClick = () => {
     if (isEditingReport) {
@@ -1576,14 +1604,14 @@ export default function DoctorDashboard() {
           leftSlot={
             <>
               <button onClick={() => setIsSidebarOpen(v => !v)} className="p-1.5 rounded-xl text-gray-500 cursor-pointer hover:bg-gray-100 transition-all duration-200" style={{ background: '#f3f4f6' }} title="Toggle sidebar"><Menu size={16} /></button>
-              {view.name === 'review' && (
-                <button onClick={handleReviewBack} className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200">{headerBackLabel}</button>
-              )}
-              {(view.name === 'patient-history' || view.name === 'appointments' || view.name === 'all-patients') && (
-                <button onClick={() => setView({ name: 'inbox' })} className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200">← Back to Inbox</button>
-              )}
             </>
           }
+        />
+        <ViewNavArrows
+          canGoBack={viewHistory.length > 0}
+          canGoForward={viewFuture.length > 0}
+          onBack={goBack}
+          onForward={goForward}
         />
         <main className="flex-1 overflow-y-auto min-w-0">
           {view.name === 'inbox' && user && (

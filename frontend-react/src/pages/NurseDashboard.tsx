@@ -8,6 +8,7 @@ import { formatDt, getEyeSide, fmtConfidence } from '../utils/format';
 import type { Patient, ScreeningSession, RetinalImage, AIResult, StaffUser, Appointment } from '../types';
 import Pagination from '../components/Pagination';
 import AppHeader from '../components/AppHeader';
+import ViewNavArrows from '../components/ViewNavArrows';
 
 const PAGE_SIZE = 15;
 
@@ -257,7 +258,7 @@ function NewPatientView({
   );
 
   return (
-    <div className="p-6 max-w-3xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-3xl mx-auto">
       <h2 className="text-2xl font-bold text-gray-900 mb-1" style={{ textShadow: '0 2px 8px rgba(0,0,0,0.18)' }}>Register New Patient</h2>
       <p className="text-sm mb-5 text-gray-500" style={{ textShadow: '0 1px 6px rgba(0,0,0,0.13)' }}>Fill in the details to create a new patient record.</p>
 
@@ -456,7 +457,7 @@ function WorkspaceView({
   };
 
   return (
-    <div className="p-6 max-w-4xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-4xl mx-auto">
       <h2 className="text-2xl font-bold text-gray-900 mb-0.5">Patient Workspace</h2>
       <h3 className="text-lg font-semibold mb-1 text-blue-600">{patient.name}</h3>
       <p className="text-xs mb-4 text-gray-500">
@@ -640,7 +641,7 @@ function SessionView({
   const rightRef = useRef<HTMLInputElement>(null);
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-5xl mx-auto">
       <h2 className="text-2xl font-bold text-gray-900 mt-2">Screening Session</h2>
       <p className="text-xs text-gray-500">Patient: {patient.name} · ID: {sessionId.slice(0, 8)}…</p>
 
@@ -1262,7 +1263,7 @@ function AppointmentsView({ currentUserId }: AppointmentsViewProps) {
   const monthCells = Array.from({ length: totalCells }, (_, i) => addDays(gridStart, i));
 
   return (
-    <div className="p-6">
+    <div className="px-6 pt-3 pb-6">
       {/* Row 1 — heading + book button */}
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-2xl font-bold text-gray-900">Appointments</h2>
@@ -1490,7 +1491,7 @@ function AllPatientsNurseView({
   const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="px-6 pt-3 pb-6 max-w-5xl mx-auto">
       <h2 className="text-2xl font-bold text-gray-900 mb-1">All Patients</h2>
       <p className="text-sm mb-4 text-gray-500">All registered patients in the system.</p>
 
@@ -1552,14 +1553,42 @@ function AllPatientsNurseView({
 export default function NurseDashboard() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
-  const [view, setView] = useState<NurseView>({ name: 'home' });
+  const [view, applyView] = useState<NurseView>({ name: 'home' });
+  // In-app sub-view history (browser-style back/forward), independent of the router.
+  const [viewHistory, setViewHistory] = useState<NurseView[]>([]);
+  const [viewFuture, setViewFuture] = useState<NurseView[]>([]);
+
+  // Centralized navigation: every normal sub-view change records history so the
+  // back/forward arrow row can replay it. Existing setView(...) call sites are
+  // unchanged — they route through this wrapper automatically.
+  const setView = (next: NurseView) => {
+    setViewHistory(h => [...h, view]);
+    setViewFuture([]);
+    applyView(next);
+  };
+
+  const goBack = () => {
+    if (viewHistory.length === 0) return;
+    const prev = viewHistory[viewHistory.length - 1];
+    setViewHistory(h => h.slice(0, -1));
+    setViewFuture(f => [view, ...f]);
+    applyView(prev);
+  };
+
+  const goForward = () => {
+    if (viewFuture.length === 0) return;
+    const next = viewFuture[0];
+    setViewFuture(f => f.slice(1));
+    setViewHistory(h => [...h, view]);
+    applyView(next);
+  };
+
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [isDragging, setIsDragging] = useState(false);
   const [sidebarQuery, setSidebarQuery] = useState('');
   const [allPatients, setAllPatients] = useState<Patient[]>([]);
   const [patientListKey, setPatientListKey] = useState(0);
-  const [returnTo, setReturnTo] = useState<'home' | 'all-patients'>('home');
 
   useEffect(() => {
     patientsAPI.search(undefined, 200)
@@ -1588,7 +1617,6 @@ export default function NurseDashboard() {
   const handleLogout = () => { logout(); navigate('/login', { replace: true }); };
 
   const handleLogoClick = () => {
-    setReturnTo('home');
     setView({ name: 'home' });
   };
 
@@ -1695,7 +1723,7 @@ export default function NurseDashboard() {
           {sidebarDisplayPatients.map(p => (
             <div key={p.id} className="mb-1">
               <button
-                onClick={() => { setReturnTo('home'); setView({ name: 'workspace', patient: p }); }}
+                onClick={() => { setView({ name: 'workspace', patient: p }); }}
                 className="w-full text-left px-3 py-2 rounded-xl text-sm text-gray-900 cursor-pointer"
                 style={{ background: '#f9fafb' }}
                 onMouseEnter={e => (e.currentTarget.style.background = '#f3f4f6')}
@@ -1763,24 +1791,14 @@ export default function NurseDashboard() {
                   <Menu size={16} />
                 </button>
               )}
-              {(view.name === 'workspace' || view.name === 'appointments' || view.name === 'new-patient' || view.name === 'all-patients') && (
-                <button
-                  onClick={() => setView({ name: view.name === 'workspace' ? returnTo : 'home' })}
-                  className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-                >
-                  ← Back to Patients
-                </button>
-              )}
-              {view.name === 'session' && (
-                <button
-                  onClick={() => setView({ name: 'workspace', patient: view.patient })}
-                  className="ml-2 text-sm font-bold text-blue-600 cursor-pointer hover:brightness-90 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-                >
-                  ← Back to Workspace
-                </button>
-              )}
             </>
           }
+        />
+        <ViewNavArrows
+          canGoBack={viewHistory.length > 0}
+          canGoForward={viewFuture.length > 0}
+          onBack={goBack}
+          onForward={goForward}
         />
         <main className="flex-1 overflow-y-auto min-w-0">
         {view.name === 'home' && (
@@ -1822,7 +1840,7 @@ export default function NurseDashboard() {
         {view.name === 'new-patient' && (
           <NewPatientView
             onBack={() => setView({ name: 'home' })}
-            onCreated={p => { setPatientListKey(k => k + 1); setReturnTo('home'); setView({ name: 'workspace', patient: p }); }}
+            onCreated={p => { setPatientListKey(k => k + 1); setView({ name: 'workspace', patient: p }); }}
           />
         )}
         {view.name === 'workspace' && (
@@ -1845,7 +1863,7 @@ export default function NurseDashboard() {
         {view.name === 'all-patients' && (
           <AllPatientsNurseView
             patients={sortedPatients}
-            onSelectPatient={p => { setReturnTo('all-patients'); setView({ name: 'workspace', patient: p }); }}
+            onSelectPatient={p => { setView({ name: 'workspace', patient: p }); }}
           />
         )}
         </main>
