@@ -150,6 +150,45 @@ export const screeningsAPI = {
     api
       .post<{ success: boolean }>(`/screenings/${sessionId}/send-report`, payload)
       .then((r) => r.data),
+
+  reportPreview: (
+    sessionId: string,
+    payload: {
+      report_markdown: string;
+      signature_data_url: string;
+      patient_name: string;
+      doctor_name: string | null;
+    }
+  ) =>
+    api
+      .post(`/screenings/sessions/${sessionId}/report-preview`, payload, { responseType: 'blob' })
+      .then((r) => r.data),
+
+  finalizeReview: (
+    sessionId: string,
+    payload: {
+      doctor_id: string;
+      decision: string;
+      override_reason: string | null;
+      final_grade_left: string | null;
+      final_grade_right: string | null;
+      report_markdown: string;
+      signature_data_url: string;
+      patient_name: string;
+      patient_email: string | null;
+      doctor_name: string | null;
+      send_to_patient: boolean;
+    }
+  ) =>
+    api
+      .post(`/screenings/sessions/${sessionId}/finalize-review`, payload)
+      .then((r) => r.data),
+
+  resendReport: (sessionId: string, payload: { patient_name: string; patient_email: string }) =>
+    api.post(`/screenings/sessions/${sessionId}/resend-report`, payload).then(r => r.data),
+
+  downloadReportPdf: (sessionId: string) =>
+    api.get(`/screenings/sessions/${sessionId}/report-pdf`, { responseType: 'blob' }).then(r => r.data),
 };
 
 // ─── Uploads API ──────────────────────────────────────────────────────────────

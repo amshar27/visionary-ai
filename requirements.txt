@@ -41,6 +41,7 @@ markdown==3.7   # ← add this line
 
 # ── Image / PDF / HTTP ────────────────────────────────────
 pillow==11.0.0
+xhtml2pdf==0.2.17   # clinical report PDF generation (base64 <img> support)
 opencv-python==4.10.0.84
 requests==2.32.3
 PyYAML==6.0.2

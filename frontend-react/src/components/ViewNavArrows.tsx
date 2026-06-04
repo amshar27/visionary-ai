@@ -18,7 +18,7 @@ export default function ViewNavArrows({ canGoBack, canGoForward, onBack, onForwa
   const disabled = 'text-blue-600 opacity-40 cursor-not-allowed';
 
   return (
-    <div className="flex-none flex items-center gap-1 px-6 py-0.5 border-b border-gray-200 bg-white">
+    <div className="flex-none flex items-center gap-1 px-6 py-0.5 border-b border-gray-200">
       <button
         onClick={onBack}
         disabled={!canGoBack}

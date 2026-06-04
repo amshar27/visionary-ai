@@ -1617,6 +1617,12 @@ export default function NurseDashboard() {
   const handleLogout = () => { logout(); navigate('/login', { replace: true }); };
 
   const handleLogoClick = () => {
+    // Already on the main dashboard → refresh its data in place instead of re-navigating.
+    if (view.name === 'home') {
+      setSidebarQuery('');
+      setPatientListKey(k => k + 1);
+      return;
+    }
     setView({ name: 'home' });
   };
 
@@ -1800,17 +1806,25 @@ export default function NurseDashboard() {
           onBack={goBack}
           onForward={goForward}
         />
-        <main className="flex-1 overflow-y-auto min-w-0">
+        <main
+          className="flex-1 overflow-y-auto min-w-0"
+          style={
+            view.name === 'home'
+              ? {
+                  backgroundColor: '#f8fafc',
+                  backgroundImage:
+                    'linear-gradient(rgba(15,23,42,0.07) 1px, transparent 1px), linear-gradient(90deg, rgba(15,23,42,0.07) 1px, transparent 1px)',
+                  backgroundSize: '44px 44px',
+                }
+              : undefined
+          }
+        >
         {view.name === 'home' && (
-          <div
-            className="flex flex-col items-center justify-center h-full text-center px-4"
-            style={{
-              backgroundImage:
-                'linear-gradient(rgba(0,0,0,0.04) 1px, transparent 1px), linear-gradient(90deg, rgba(0,0,0,0.04) 1px, transparent 1px)',
-              backgroundSize: '44px 44px',
-            }}
-          >
-            <div className="bg-white rounded-2xl shadow-xl px-10 py-10 flex flex-col items-center">
+          <div className="flex flex-col items-center justify-center h-full text-center px-4">
+            <div
+              className="bg-white rounded-2xl px-10 py-10 flex flex-col items-center"
+              style={{ boxShadow: '0 24px 60px -12px rgba(15, 23, 42, 0.22)' }}
+            >
             {/* Icon badge */}
             <div className="bg-blue-50 p-5 rounded-full mb-6">
               <Users className="w-12 h-12 text-blue-600" />

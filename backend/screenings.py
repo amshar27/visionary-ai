@@ -1,14 +1,18 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, Literal
 from uuid import UUID
 from datetime import datetime
+from io import BytesIO
 
 import re
 import markdown
+import requests
 
 from .db import supabase
 from .notification_service import send_clinical_report
+from .pdf_service import generate_report_pdf
 
 router = APIRouter(prefix="/screenings", tags=["screenings"])
 
@@ -370,6 +374,216 @@ def send_report_to_patient(session_id: UUID, payload: SendReportRequest):
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to send clinical report email.")
     return {"success": True}
+
+
+# ============================================================
+# Doctor-signature report flow (preview + finalize)
+# Bucket for finalized report PDFs
+# ============================================================
+REPORTS_BUCKET = "reports"
+
+
+class ReportPreviewRequest(BaseModel):
+    report_markdown: str
+    signature_data_url: str
+    patient_name: str
+    doctor_name: Optional[str] = None
+
+
+class FinalizeReviewRequest(BaseModel):
+    doctor_id: str
+    decision: str
+    override_reason: Optional[str] = None
+    final_grade_left: Optional[str] = None
+    final_grade_right: Optional[str] = None
+    report_markdown: str
+    signature_data_url: str
+    patient_name: str
+    patient_email: Optional[str] = None
+    doctor_name: Optional[str] = None
+    send_to_patient: bool
+
+
+# ------------------------------------------------------------
+# Preview the signed report PDF (NO database writes)
+# POST /screenings/sessions/{session_id}/report-preview
+# ------------------------------------------------------------
+@router.post("/sessions/{session_id}/report-preview")
+def report_preview(session_id: UUID, payload: ReportPreviewRequest):
+    try:
+        pdf_bytes = generate_report_pdf(
+            payload.patient_name,
+            payload.report_markdown,
+            payload.signature_data_url,
+            payload.doctor_name,
+        )
+        return StreamingResponse(
+            BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": 'inline; filename="preview.pdf"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate preview PDF: {e}")
+
+
+# ------------------------------------------------------------
+# Finalize the review: generate PDF, store it, write DB rows,
+# optionally email the patient.
+# POST /screenings/sessions/{session_id}/finalize-review
+# ------------------------------------------------------------
+@router.post("/sessions/{session_id}/finalize-review")
+def finalize_review(session_id: UUID, payload: FinalizeReviewRequest):
+    try:
+        sid = str(session_id)
+
+        # 1) Generate the signed PDF
+        pdf_bytes = generate_report_pdf(
+            payload.patient_name,
+            payload.report_markdown,
+            payload.signature_data_url,
+            payload.doctor_name,
+        )
+
+        # 2) Upload PDF to the `reports` bucket (mirror retinal-scans pattern)
+        path = f"{sid}.pdf"
+        storage = supabase.storage.from_(REPORTS_BUCKET)
+        storage.upload(
+            path,
+            pdf_bytes,
+            file_options={"content-type": "application/pdf", "upsert": "true"},
+        )
+        report_url = storage.get_public_url(path)
+
+        # 3) Update session status to match decision (same as doctor-review)
+        supabase.table("screening_sessions").update(
+            {"status": payload.decision}
+        ).eq("id", sid).execute()
+
+        # 4) Insert doctor review row (same shape as doctor-review + report_url)
+        insert_data = {
+            "screening_session_id": sid,
+            "doctor_id": str(payload.doctor_id),
+            "decision": payload.decision,
+            "reviewed_at": datetime.utcnow().isoformat(),
+            "final_grade_left": payload.final_grade_left,
+            "final_grade_right": payload.final_grade_right,
+            "override_reason": payload.override_reason,
+            "report_url": report_url,
+        }
+        supabase.table("doctor_reviews").insert(insert_data).execute()
+
+        # 5) Optionally email the PDF to the patient
+        emailed = False
+        if payload.send_to_patient and payload.patient_email:
+            emailed = send_clinical_report(
+                payload.patient_name,
+                payload.patient_email,
+                payload.report_markdown,
+                sid,
+                pdf_bytes=pdf_bytes,
+            )
+
+        # 6) Return result
+        return {"success": True, "report_url": report_url, "emailed": emailed}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to finalize review: {e}")
+
+
+# ------------------------------------------------------------
+# Re-send the ALREADY-SAVED signed PDF to the patient by email.
+# No regeneration, no new signature — fetches doctor_reviews.report_url.
+# POST /screenings/sessions/{session_id}/resend-report
+# ------------------------------------------------------------
+class ResendReportRequest(BaseModel):
+    patient_name: str
+    patient_email: str
+
+
+@router.post("/sessions/{session_id}/resend-report")
+def resend_report(session_id: UUID, payload: ResendReportRequest):
+    try:
+        sid = str(session_id)
+
+        # 1) Latest doctor review row for this session
+        review_res = (
+            supabase.table("doctor_reviews")
+            .select("report_url")
+            .eq("screening_session_id", sid)
+            .order("reviewed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest = _first(review_res.data or [])
+        report_url = latest.get("report_url") if latest else None
+        if not report_url:
+            raise HTTPException(status_code=404, detail="No saved report found for this session")
+
+        # 2) Download the stored PDF bytes
+        r = requests.get(report_url)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch stored report")
+        pdf_bytes = r.content
+
+        # 3) Email the saved PDF (cover-letter body; report_markdown unused now)
+        ok = send_clinical_report(
+            payload.patient_name,
+            payload.patient_email,
+            "",
+            sid,
+            pdf_bytes=pdf_bytes,
+        )
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to send clinical report email.")
+
+        return {"success": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------------------------------------------------
+# Download the ALREADY-SAVED signed PDF (view-only export).
+# GET /screenings/sessions/{session_id}/report-pdf
+# ------------------------------------------------------------
+@router.get("/sessions/{session_id}/report-pdf")
+def download_report_pdf(session_id: UUID):
+    try:
+        sid = str(session_id)
+
+        # Latest doctor review row for this session
+        review_res = (
+            supabase.table("doctor_reviews")
+            .select("report_url")
+            .eq("screening_session_id", sid)
+            .order("reviewed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest = _first(review_res.data or [])
+        report_url = latest.get("report_url") if latest else None
+        if not report_url:
+            raise HTTPException(status_code=404, detail="No saved report found")
+
+        # Download the stored PDF bytes
+        r = requests.get(report_url)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch stored report")
+
+        return StreamingResponse(
+            BytesIO(r.content),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="report_{sid}.pdf"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------

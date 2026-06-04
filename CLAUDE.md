@@ -11,7 +11,7 @@ Clinical-grade eye disease screening system built as a Final Year Project for Ma
 | Backend API | FastAPI (Python), run via uvicorn |
 | Frontend | React + TypeScript (Vite), port 5173 |
 | Database | Supabase (PostgreSQL) |
-| Storage | Supabase Storage (bucket: `retinal-scans`, `guidelines`) |
+| Storage | Supabase Storage (buckets: `retinal-scans`, `guidelines`, `reports`) |
 | AI Model | PyTorch — ResNetWithAttention (ResNet152 + MultiheadAttention) |
 | AI Explainability | Grad-CAM heatmaps via `pytorch-grad-cam` |
 | LLM (summaries) | OpenAI `gpt-4o-mini` |
@@ -20,6 +20,9 @@ Clinical-grade eye disease screening system built as a Final Year Project for Ma
 | RAG evaluation | RAGAS (`ragas` + HuggingFace `datasets`) — faithfulness, answer_relevancy, context_utilization (lazy-imported) |
 | Multi-Agent Pipeline | CrewAI — four-agent crew (Researcher: gpt-4o-mini, Brief Critic: gpt-4o-mini, Writer: gpt-4o, Report Critic: gpt-4o-mini) with conditional revision loop — see `backend/agents/` |
 | Rich-text editor | TipTap (`@tiptap/react`, `@tiptap/starter-kit`, `tiptap-markdown`) — WYSIWYG editing of RAG reports |
+| PDF generation | xhtml2pdf (`pisa`) — `backend/pdf_service.py` renders the signed clinical report PDF (supports base64 signature `<img>`) |
+| Doctor signature | `react-signature-canvas` — canvas capture exported as a PNG data URL |
+| PDF preview (frontend) | `react-pdf@9.1.1` (PDF.js / pdfjs-dist `4.4.168`, worker from cdnjs) — canvas render of the report preview |
 | Auth | Custom bcrypt — no JWT; user object stored in `localStorage` |
 | Email | Resend (`RESEND_API_KEY`) |
 | Scheduler | APScheduler (BackgroundScheduler) — runs in-process |
@@ -70,13 +73,14 @@ visionary_ai/
 │   ├── auth_reset.py             # /auth/forgot-password + /auth/verify-otp + /auth/reset-password
 │   ├── auth_utils.py             # bcrypt hash_password / verify_password
 │   ├── patients.py               # /patients CRUD
-│   ├── screenings.py             # /screenings workflow + send-report
+│   ├── screenings.py             # /screenings workflow + send-report + signature PDF flow (preview/finalize/resend/report-pdf)
 │   ├── uploads.py                # /uploads/retinal (multipart, upserts by eye_side)
 │   ├── ai.py                     # /ai/* — model inference, Grad-CAM, multi-agent RAG
 │   ├── staff.py                  # /staff/doctors
 │   ├── admin.py                  # /admin/* staff and patient management
 │   ├── appointments.py           # /appointments CRUD with 30-min overlap check
-│   ├── notification_service.py   # Resend email: confirmation, reminder, clinical report, OTP
+│   ├── notification_service.py   # Resend email: confirmation, reminder, clinical report (cover + PDF attachment), OTP
+│   ├── pdf_service.py            # generate_report_pdf() — xhtml2pdf signed clinical report PDF
 │   ├── scheduler.py              # APScheduler: send_reminders + auto_no_show (every 1 min)
 │   ├── requirements.txt          # backend-specific deps
 │   ├── agents/                   # CrewAI multi-agent RAG pipeline (four agents, 3-phase)
@@ -170,8 +174,14 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `GET /screenings/{id}` — single session (joins patient)
 - `GET /screenings/{id}/doctor-review/latest` — most recent doctor_reviews row
 - `POST /screenings/{id}/doctor-review` — inserts review, updates session status to approved/overridden. Blocked if status is already in `LOCKED_STATUSES` (`{approved, overridden}`). If `assigned_doctor_id` is set on the session, only that doctor may submit (returns 403 otherwise). When `decision="overridden"`, `override_reason` is required (returns 400 if missing/empty).
-- `POST /screenings/{id}/send-report` — converts markdown report to HTML, emails patient via Resend
+- `POST /screenings/{id}/send-report` — converts markdown report to HTML, emails patient via Resend (legacy/manual send; the signature flow below now persists + emails the PDF instead, and the review UI no longer calls this)
 - `DELETE /screenings/{id}` — only deletes pending sessions with no uploads and no assigned doctor
+
+**Doctor-signature PDF flow** (paths sit under the `/screenings` router prefix → `/screenings/sessions/...`):
+- `POST /screenings/sessions/{session_id}/report-preview` — body `{report_markdown, signature_data_url, patient_name, doctor_name?}`. Calls `generate_report_pdf(...)` and **streams the PDF back** (`application/pdf`, `Content-Disposition: inline; filename="preview.pdf"`). **No DB writes** — preview only.
+- `POST /screenings/sessions/{session_id}/finalize-review` — the **only commit** of the signed flow. Body: `{doctor_id, decision, override_reason?, final_grade_left?, final_grade_right?, report_markdown, signature_data_url, patient_name, patient_email?, doctor_name?, send_to_patient}`. Steps: (1) `generate_report_pdf`; (2) upload to the `reports` bucket at `{session_id}.pdf` (upsert; public URL captured as `report_url`); (3) update session `status = decision`; (4) insert a `doctor_reviews` row (same shape as `doctor-review` + `report_url`); (5) if `send_to_patient` **and** `patient_email`, email the PDF via `send_clinical_report(..., pdf_bytes=...)`. Returns `{success, report_url, emailed}`.
+- `POST /screenings/sessions/{session_id}/resend-report` — body `{patient_name, patient_email}`. Re-emails the **already-saved** PDF: reads the latest `doctor_reviews.report_url`, downloads the bytes with `requests.get`, calls `send_clinical_report(..., pdf_bytes=...)`. 404 if no saved report/`report_url`; 502 if the download fails. Returns `{success: true}`. No regeneration, no new signature.
+- `GET /screenings/sessions/{session_id}/report-pdf` — downloads the already-saved PDF (latest `doctor_reviews.report_url`) as a `StreamingResponse` (`application/pdf`, `attachment; filename="report_{session_id}.pdf"`). 404 if none. Backs the doctor "Export as PDF" button on view-only sessions.
 
 ### `uploads.py` — `/uploads`
 - `POST /uploads/retinal` — multipart upload to `retinal-scans` bucket; UPSERTS on `(screening_session_id, eye_side)` so re-uploading replaces rather than duplicates. Saves both `image_path` and the public `image_url` to the DB row. Cleans up the old storage object after a successful replace.
@@ -233,8 +243,11 @@ All endpoints check `requester_role == "admin"`.
 Resend email helpers (all fire-and-forget, return bool):
 - `send_appointment_confirmation(...)` — blue header, appointment details
 - `send_appointment_reminder(...)` — purple header, "tomorrow" reminder
-- `send_clinical_report(...)` — green header, approved RAG report HTML
+- `send_clinical_report(patient_name, patient_email, report_html, session_id, pdf_bytes=None)` — green-header **cover-letter** email for "Hospital Ampang Jaya" (prepared-for line, hospital name, today's date, short body, blue-bold do-not-reply disclaimer). The report body is **no longer embedded** — the full report is the **PDF attachment** when `pdf_bytes` is provided (attachment filename = sanitised patient name + `YYYY-MM-DD_HHMM`). Subject is unique per report (`Your Clinical Report — {patient_name} ({DD Mon YYYY})`) to stop Gmail threading. `report_html` is now only used by the legacy `/send-report` path.
 - `send_otp_email(to_email, to_name, otp_code)` — dark-themed OTP email for password reset (10-min expiry)
+
+### `pdf_service.py`
+`generate_report_pdf(patient_name, report_markdown, signature_data_url=None, doctor_name=None) -> bytes` — renders the clinical report markdown → HTML → PDF via **xhtml2pdf** (`pisa`). When `signature_data_url` (a `data:image/png;base64,...` URL) is provided, appends a certification block ("I hereby certify that I have reviewed this clinical report.", the base64 signature `<img>`, a signature line, the doctor name + "Reviewing Doctor") above the footer disclaimer; otherwise renders without it. Used by `report-preview` and `finalize-review`.
 
 ### `scheduler.py`
 APScheduler `BackgroundScheduler` runs two jobs every 1 minute (started from `main.py`'s `startup` event):
@@ -351,10 +364,17 @@ Routes are in `App.tsx`. `ProtectedRoute` redirects unauthenticated users to `/l
 Both NurseDashboard and DoctorDashboard render a **browser-style back/forward arrow row** (`src/components/ViewNavArrows.tsx`) directly below `<AppHeader>`, on **every** sub-view (including Nurse `home` / Doctor `inbox`). It navigates the user's **in-app sub-view history**, independent of the router/browser history API.
 - Each dashboard's sub-view `useState` setter is renamed `applyView`; a wrapper `setView(next)` pushes the current view onto a `viewHistory` stack, clears `viewFuture`, then applies the new view. **All existing `setView(...)` call sites are unchanged** — they get history tracking automatically. `goBack`/`goForward` move views between the two stacks.
 - The row is rendered **once per dashboard** in a single fixed location (a `flex-none` sibling between `<AppHeader>` and `<main>`); it is **not** duplicated per sub-view. Arrows are bold blue `ArrowLeft`/`ArrowRight` lucide icons (`size={18}`, `strokeWidth={3}`), back-on-left/forward-on-right, in `w-8 h-7` buttons on a `px-6 py-0.5` container.
+- The row container has a **transparent background** (only `border-b border-gray-200`) — no `bg-white`/pill/box behind the arrows — so it looks identical on every view, sitting on plain white (the grid/net background is on `<main>`, **below** the row, so nothing patterned shows behind the arrows). The arrow buttons themselves have no persistent fill (`hover:bg-blue-50` on enabled hover only).
 - Back is disabled (faded `opacity-40 cursor-not-allowed`) when `viewHistory` is empty; forward when `viewFuture` is empty — so on home/inbox both arrows are usually disabled. Disabled buttons set the `disabled` attribute.
 - The old contextual in-header back buttons ("← Back to Patients", "← Back to Workspace", "← Back to Inbox", "← Back") were **removed** from both dashboards' `AppHeader` `leftSlot` (now only the hamburger toggle remains) since the arrow row supersedes them. The Nurse `returnTo` state and the Doctor `headerBackLabel` constant were removed as dead code; `handleReviewBack` is kept (still wired to `ReviewView`'s `onBack` and the approve/override return-to-origin flow).
 - Deeper sub-views (those other than home/inbox originally) use `px-6 pt-3 pb-6` instead of `p-6` to keep content tight under the arrow row; Nurse `home` and Doctor `inbox` retain `p-6`.
 - **Admin dashboard does NOT have the arrow row.**
+
+### Grid/net background
+A faint grid/net pattern sits behind **only the Nurse `home` (welcome/empty-state) view's main content**. It is applied via inline `style` on that dashboard's `<main>` element (scoped with `view.name === 'home' ? {...} : undefined`), **not** on the shared content column — so it sits **below** the arrow row (the row stays on plain white) and never appears behind the header. Style: `backgroundColor: '#f8fafc'` + two `linear-gradient` line layers at `rgba(15,23,42,0.07)`, `backgroundSize: '44px 44px'`.
+- The **Doctor dashboard has no grid background** (it was added to the Doctor `inbox` `<main>` at one point, then removed — the Doctor inbox content area sits on a plain background).
+- The Nurse `home` welcome card (white card with the people icon, intro text, and "+ Add New Patient" button) uses `rounded-2xl` + an inline soft elevated shadow `boxShadow: '0 24px 60px -12px rgba(15,23,42,0.22)'` (replacing the old `shadow-xl` class) so it clearly lifts off the grid.
+- **Admin dashboard has no grid background.**
 
 ### NurseDashboard — 6 sub-views (`NurseView` discriminated union)
 1. **home** — search patients by name or IC/passport (default landing view)
@@ -370,7 +390,7 @@ Sidebar patient list shows patient name only (IC line removed). Required fields 
 1. **inbox** — list sessions assigned to the logged-in doctor. Status filter options: `all | assigned | approved | overridden` ('pending' excluded — doctors only see sessions that have been assigned to them). Table column header is "Session No." (not "No."). Top-right of the inbox header has a **Clear** button (eraser icon, `bg-red-500 text-white`; disabled state: `bg-gray-200 text-gray-400 opacity-60 cursor-not-allowed`) next to the refresh button — opens a confirmation modal and hides all currently-visible approved/overridden sessions from the inbox view only (frontend-only, no DB writes). Disabled when there are zero clearable sessions in the current visible list.
 2. **patient-history** — opened by clicking a patient in the sidebar. Title "{patient_name} — Screening History"; same table layout, status filter pills, and refresh button as the inbox, but **no Clear button** and the cleared-IDs filter is deliberately **not** applied here (this view is the way to access cleared sessions). Filters `assignedSessions` to only those whose `patient_id === selectedPatientId`.
 3. **all-patients** — full table (Name, IC/Passport, Sessions) of patients with ≥1 session assigned to this doctor. Reached via the "See more patients →" link in the sidebar; back returns to inbox. Clicking a patient name navigates to `patient-history` for that patient. The Sessions column is the count of that doctor's `assignedSessions` per patient (computed locally from the in-memory list, no extra API call). IC/Passport is resolved from a `patientIcMap` populated once on mount via `patientsAPI.search(undefined, 200)` — sessions to-the-doctor don't carry `ic_passport`, so this auxiliary lookup is required.
-4. **review** — AI Verdict section with original/heatmap toggle (EyePanel), per-eye edit widgets, RAG report, and Approve or Submit button. Raw retinal images are **not** shown as a separate section — they are accessible only via the heatmap toggle within AI Verdict. The old Override modal has been removed.
+4. **review** — AI Verdict section with original/heatmap toggle (EyePanel), per-eye edit widgets, RAG report, and a **Doctor Actions** area. Raw retinal images are **not** shown as a separate section — they are accessible only via the heatmap toggle within AI Verdict. The old Override modal has been removed. For non-locked (`analysed`) sessions Doctor Actions is a single **Approve** button that launches the signature → preview → finalize flow (see below). For locked (`approved`/`overridden`, view-only) sessions it shows **Send Report to Patient** + **Export as PDF** plus a "This session is view-only…" notice.
 5. **appointments** — calendar view of appointments assigned to this doctor
 
 **Clear button — localStorage persistence**: cleared session IDs are stored under `visionary_doctor_cleared_{doctor_id}` (per-doctor). State is loaded into a `Set<string>` on mount and persisted on every change. On each `assignedSessions` refresh the cleared list is pruned of any IDs no longer present (e.g. session reassigned away). The list is intentionally never cleared on logout — closing/clearing localStorage is the only reset path.
@@ -381,7 +401,7 @@ Sidebar patient list shows patient name only (IC line removed). Required fields 
 - Each eye widget has an **Edit** button (visible when session is not locked, but **disabled/greyed-out until a RAG report has been generated** — tooltip: "Generate Clinical Report Summary first"). The button uses a red/orange gradient style; when disabled it is `opacity-40 grayscale cursor-not-allowed`.
 - Clicking Edit switches the widget into a 3-field form: Disease Detected, Disease Type, Severity. Severity options are driven by `getSeverityOptions(diseaseType, diseaseDetected)`.
 - Clicking **Confirm** opens a custom `showOverrideConfirm` modal. On confirmation, calls `PATCH /ai/result/{id}`, updates local `aiResults` state, and collapses the widget to a post-edit summary with a "Doctor Edited" amber badge. Also clears `ragResult` locally (set to `null`) and shows a toast "Clinical summary cleared — click Regenerate to update it". The RAG section then shows a yellow "Needs Regeneration" card with a "Regenerate Clinical Summary" button instead of the previous report.
-- When at least one eye has been edited, the **Approve** button is replaced by a **Submit** button. Submit calls `POST /screenings/{id}/doctor-review` with `decision=overridden` and a fixed override reason.
+- The Doctor Actions button always **displays** as green "✅ Approve" regardless of edit state; the committed `decision` is computed from edit flags (any eye edited, OR the report text edited via `reportEdited`) → `overridden`, else `approved` (see the signature/finalize flow below). The legacy `POST /screenings/{id}/doctor-review` endpoint is no longer called by the UI — the signed `finalize-review` flow records the review.
 - All edit state (`leftEditing`, `rightEditing`, `leftEdited`, `rightEdited`, `leftEditForm`, `rightEditForm`, `leftConfirmed`, `rightConfirmed`, `showOverrideConfirm`, `pendingConfirmEye`) resets when the doctor navigates to a different session.
 
 **RAG report inline edit flow** (TipTap WYSIWYG):
@@ -389,7 +409,15 @@ Sidebar patient list shows patient name only (IC line removed). Required fields 
 - Clicking Edit enters edit mode by mounting `<RagReportEditor>` (`src/components/RagReportEditor.tsx`) — a TipTap editor with `StarterKit` + the `tiptap-markdown` extension. The editor parses the current `rag_summary` as markdown on mount and exposes `getMarkdown()` via a `forwardRef` handle so the parent can pull serialized markdown back out. Toolbar buttons cover H3 / Bold / Italic / Bullet / Numbered list / Undo / Redo. The editor surface is styled (h3 17px medium, bold labels, tight lists) to match the view-mode markdown layout.
 - Clicking **Cancel** exits edit mode without saving; the Edit button reappears.
 - Clicking **Confirm** opens a `showSaveReportConfirm` modal. On confirmation, reads markdown via `reportEditorRef.current?.getMarkdown()`, calls `PATCH /ai/rag-summary/{session_id}` via `aiAPI.updateRagSummary`, and updates local `ragResult`.
-- Edit state (`isEditingReport`, `showSaveReportConfirm`, `reportEditorRef`) resets when the doctor navigates to a different session. The `<RagReportEditor key={sessionId} />` key forces a fresh editor instance per session so its content reflects the new report.
+- Edit state (`isEditingReport`, `showSaveReportConfirm`, `reportEditorRef`) resets when the doctor navigates to a different session. The `<RagReportEditor key={sessionId} />` key forces a fresh editor instance per session so its content reflects the new report. A successful report-text save also sets `reportEdited = true`, which makes the eventual finalize commit an `overridden` decision.
+
+**Doctor signature → preview → finalize flow** (replaces the old direct Approve/Submit commit and the old "Send Report to Patient" inline button + `showSendConfirm` modal):
+- Clicking **Approve** sets `pendingDecision` (`overridden` if any eye OR the report was edited, else `approved`) and opens a 3-step modal sequence. The actual commit happens only at the end.
+- **Modal 1 — Signature**: a `react-signature-canvas` pad ("I hereby certify…"). Confirm (disabled/blurred until a stroke exists) captures a PNG data URL and calls `screeningsAPI.reportPreview(...)` → receives a PDF blob.
+- **Modal 2 — Preview**: renders the PDF with `react-pdf` (PDF.js worker pinned to cdnjs `pdf.js/4.4.168`; the blob is converted to a `{ data: Uint8Array }` object and **all** pages are rendered onto canvas via the `onLoadSuccess` page count), plus an "Open PDF in new tab" link. Asks "Send this report to the patient?" → **No, just save** / **Yes, send to patient** (both → final confirm); **Back** returns to the signature pad (the preview blob URL is kept alive until finalize, only revoked at the very end).
+- **Modal 3 — Confirm**: calls `screeningsAPI.finalizeReview(...)` — the single commit (PDF → `reports` bucket, status, `doctor_reviews` row + `report_url`, optional email). `send_to_patient` is forced false when there is no patient email. On success it also triggers a local download of the same PDF (filename = sanitised patient name + `YYYY-MM-DD_HHMM`) and runs the return-to-origin redirect. `override_reason` is built from what was edited: `"Doctor manually edited AI results and the clinical report."` (either/both).
+- **View-only Doctor Actions** (`approved`/`overridden`): **Send Report to Patient** (blue) opens `showResendConfirm` → `screeningsAPI.resendReport(...)` (re-emails the saved PDF; or shows "No patient email on record."); **Export as PDF** (neutral) calls `screeningsAPI.downloadReportPdf(...)` and downloads the stored PDF (same filename pattern). A muted notice states the session is finalized/view-only.
+- All signature-flow state (`showSignatureModal`, `showPreviewModal`, `showFinalConfirm`, `signatureEmpty`, `previewPdfUrl`, `previewBlob`, `previewData`, `numPages`, `pendingDecision`, `sendToPatient`, `flowLoading`, `signatureDataUrl`, `reportEdited`, `showResendConfirm`, `resendLoading`, `exportLoading`) resets when the doctor navigates to a different session.
 
 **Inbox row helpers** — `extractPatientName(s)` and `extractAssignedByName(s)` (top of `DoctorDashboard.tsx`) read patient/nurse names defensively from either the nested Supabase join shape (`s.patients?.name`, `s.created_by_user?.name`) or the flat enriched-API shape (`patient_name`, `assigned_by_name`). Use these instead of accessing the raw fields directly.
 
@@ -463,6 +491,11 @@ The `retinal_images` table column is `uploaded_at` (set in `uploads.py:82`). The
 - `aiAPI.summariseRAGCrew(sessionId)` — calls `POST /ai/summarise-rag-crew`, the **live** RAG endpoint used by the doctor review screen.
 - `aiAPI.summariseRAG(sessionId)` — still exported, but the backing endpoint `/ai/summarise-rag` is disabled (commented out in `ai.py`). Calling it will 404. Use `summariseRAGCrew` instead.
 - `aiAPI.updateRagSummary(sessionId, ragSummary)` — calls `PATCH /ai/rag-summary/{id}`, used by the doctor TipTap report editor.
+- `screeningsAPI.reportPreview(sessionId, payload)` — `POST /screenings/sessions/{id}/report-preview`, `responseType: 'blob'` (signed PDF preview, no DB write).
+- `screeningsAPI.finalizeReview(sessionId, payload)` — `POST /screenings/sessions/{id}/finalize-review` (the signed-review commit).
+- `screeningsAPI.resendReport(sessionId, {patient_name, patient_email})` — `POST /screenings/sessions/{id}/resend-report` (re-email the saved PDF).
+- `screeningsAPI.downloadReportPdf(sessionId)` — `GET /screenings/sessions/{id}/report-pdf`, `responseType: 'blob'` (download the saved PDF).
+- `screeningsAPI.sendReport(...)` — legacy `/send-report`; still exported but no longer called by the review UI (superseded by the signature flow).
 
 ---
 
@@ -490,6 +523,8 @@ Exceptions to the wrapper pattern:
 - **`GET /ai/rag-summary/{id}`** returns `{rag_summary: string | null}` (no `ok`).
 - **`PATCH /ai/rag-summary/{id}`** returns `{ok: true, message: "RAG summary updated"}`.
 - **`POST /screenings/{id}/send-report`** returns `{success: true}`.
+- **`POST /screenings/sessions/{id}/report-preview`** and **`GET /screenings/sessions/{id}/report-pdf`** stream raw PDF bytes (`application/pdf`), not a JSON wrapper.
+- **`POST /screenings/sessions/{id}/finalize-review`** returns `{success, report_url, emailed}`; **`POST /screenings/sessions/{id}/resend-report`** returns `{success: true}`.
 - **`POST /ai/evaluate-rag/{id}`** returns `{ok, session_id, condition, scores}`.
 - **`GET /ai/rag-trace/{id}`** returns `{session_id, condition, search_query, num_retrieved, retrieved_chunks, final_report}` (no `ok`).
 - **`GET /ai/health`** returns `{ok, model_loaded, device, num_classes, classes}`.
@@ -508,4 +543,4 @@ Exceptions to the wrapper pattern:
 - **Tailwind CSS** is used throughout the frontend (dark theme, `bg-[#0b0f14]` is the base background color).
 - **react-hot-toast** is used for all notifications (top-right, 4s, dark styled).
 - **Long-list pagination** — Lists that can exceed 15 items use the shared `<Pagination>` component (`src/components/Pagination.tsx`). It renders only when `totalItems > 15`, shows 15 per page, includes Prev/Next arrows + numbered pages with ellipsis compression beyond 7 pages, and smooth-scrolls to the table top on page change. Currently applied to: Doctor Inbox, Doctor Patient History, Doctor All Patients, Nurse All Patients, Nurse Workspace screening sessions (all 15/page), and Admin System Users + Admin All Patients (10/page).
-- **App header with home shortcut** — All three dashboards render an `<AppHeader>` component (`src/components/AppHeader.tsx`) at the top of their main content area. It contains a "Visionary AI" logo (inline SVG eye + wordmark) that, when clicked, returns the user to their dashboard's home view (Nurse → `home`, Doctor → `inbox`, Admin → `users`). The component accepts optional `leftSlot` and `rightSlot` props so dashboards can host the hamburger toggle (left) and user/sign-out controls (right) inside the same bar. (The contextual "← Back to …" buttons that used to live in `leftSlot` were removed — in-app back navigation is now handled by the `ViewNavArrows` row rendered below the header; see the Back/Forward sub-view navigation section.) On DoctorDashboard, if the TipTap RAG editor has unsaved changes (`isEditingReport === true`), clicking the logo opens a confirmation modal (`showLogoLeaveConfirm`) before navigating; per-eye edits and other in-progress states do not trigger this guard. `isEditingReport` is lifted to the `DoctorDashboard` level (controlled prop into `ReviewView`) so the logo handler can read it.
+- **App header with home shortcut** — All three dashboards render an `<AppHeader>` component (`src/components/AppHeader.tsx`) at the top of their main content area. It contains a "Visionary AI" logo (inline SVG eye + wordmark) that, when clicked, returns the user to their dashboard's home view (Nurse → `home`, Doctor → `inbox`, Admin → `users`). The component accepts optional `leftSlot` and `rightSlot` props so dashboards can host the hamburger toggle (left) and user/sign-out controls (right) inside the same bar. (The contextual "← Back to …" buttons that used to live in `leftSlot` were removed — in-app back navigation is now handled by the `ViewNavArrows` row rendered below the header; see the Back/Forward sub-view navigation section.) On DoctorDashboard, if the TipTap RAG editor has unsaved changes (`isEditingReport === true`), clicking the logo opens a confirmation modal (`showLogoLeaveConfirm`) before navigating; per-eye edits and other in-progress states do not trigger this guard. `isEditingReport` is lifted to the `DoctorDashboard` level (controlled prop into `ReviewView`) so the logo handler can read it. **Refresh-in-place**: clicking the logo while **already on the main view** (Doctor `inbox` / Nurse `home`) refreshes that view's data in place instead of re-navigating — Doctor bumps a `mainRefreshKey` (remounts `InboxView` to refetch + re-runs the `assignedSessions` fetch) and clears the sidebar search; Nurse bumps `patientListKey` (refetches the patient list) and clears the sidebar search. It does **not** call `window.location.reload()`. (Admin is unchanged.)

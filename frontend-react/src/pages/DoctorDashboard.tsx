@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { RefreshCw, LogOut, Search, Menu, ChevronLeft, CalendarDays, X, ChevronRight, Mail, Pencil, Eraser } from 'lucide-react';
+import { RefreshCw, LogOut, Search, Menu, ChevronLeft, CalendarDays, X, ChevronRight, Pencil, Eraser, Mail, Download } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ReactMarkdown from 'react-markdown';
 import { useAuth } from '../context/AuthContext';
@@ -12,6 +12,10 @@ import RagReportEditor, { type RagReportEditorHandle } from '../components/RagRe
 import Pagination from '../components/Pagination';
 import AppHeader from '../components/AppHeader';
 import ViewNavArrows from '../components/ViewNavArrows';
+import SignatureCanvas from 'react-signature-canvas';
+import { Document, Page, pdfjs } from 'react-pdf';
+
+pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs`;
 
 const PAGE_SIZE = 15;
 
@@ -529,14 +533,31 @@ function ReviewView({
   const [showSaveReportConfirm, setShowSaveReportConfirm] = useState(false);
   const reportEditorRef = useRef<RagReportEditorHandle>(null);
 
-  const [showSendConfirm, setShowSendConfirm] = useState(false);
-  const [sendingReport, setSendingReport] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+  // ── Signature → Preview → Final-confirm flow state ──
+  const [showSignatureModal, setShowSignatureModal] = useState(false);
+  const [showPreviewModal, setShowPreviewModal] = useState(false);
+  const [showFinalConfirm, setShowFinalConfirm] = useState(false);
+  const [signatureEmpty, setSignatureEmpty] = useState(true);
+  const [previewPdfUrl, setPreviewPdfUrl] = useState<string | null>(null);
+  const [pendingDecision, setPendingDecision] = useState<'approved' | 'overridden' | null>(null);
+  const [sendToPatient, setSendToPatient] = useState(false);
+  const [flowLoading, setFlowLoading] = useState(false);
+  const sigCanvasRef = useRef<SignatureCanvas | null>(null);
+  const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
+  const [previewBlob, setPreviewBlob] = useState<Blob | null>(null);
+  const [previewData, setPreviewData] = useState<{ data: Uint8Array } | null>(null);
+  const [numPages, setNumPages] = useState<number>(0);
+
+  // ── View-only resend (re-email the already-saved signed PDF) ──
+  const [showResendConfirm, setShowResendConfirm] = useState(false);
+  const [resendLoading, setResendLoading] = useState(false);
+  const [exportLoading, setExportLoading] = useState(false);
 
   const [leftEditing, setLeftEditing] = useState(false);
   const [rightEditing, setRightEditing] = useState(false);
   const [leftEdited, setLeftEdited] = useState(false);
   const [rightEdited, setRightEdited] = useState(false);
+  const [reportEdited, setReportEdited] = useState(false);
 
   const [leftEditForm, setLeftEditForm] = useState({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
   const [rightEditForm, setRightEditForm] = useState({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
@@ -574,6 +595,7 @@ function ReviewView({
     setRightEditing(false);
     setLeftEdited(false);
     setRightEdited(false);
+    setReportEdited(false);
     setLeftEditForm({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
     setRightEditForm({ disease_detected: 'Yes', disease_type: 'Diabetic Retinopathy', severity: 'No DR' });
     setLeftConfirmed(null);
@@ -582,6 +604,16 @@ function ReviewView({
     setPendingConfirmEye(null);
     setIsEditingReport(false);
     setShowSaveReportConfirm(false);
+    setShowSignatureModal(false);
+    setShowPreviewModal(false);
+    setShowFinalConfirm(false);
+    setSignatureEmpty(true);
+    setPendingDecision(null);
+    setSendToPatient(false);
+    setSignatureDataUrl(null);
+    setShowResendConfirm(false);
+    setResendLoading(false);
+    setPreviewPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
   }, [sessionId, refreshKey]);
 
   const status = (session?.status ?? '').toLowerCase();
@@ -593,17 +625,10 @@ function ReviewView({
   const leftRes = aiResults.filter(r => getEyeSide(r as unknown as Record<string, unknown>) === 'left').sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null;
   const rightRes = aiResults.filter(r => getEyeSide(r as unknown as Record<string, unknown>) === 'right').sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null;
 
-  const handleApprove = async () => {
-    setSubmitting(true);
-    try {
-      await screeningsAPI.submitReview(sessionId, { doctor_id: user.user_id, decision: 'approved' });
-      toast.success('Approved. Session is now locked.');
-      onBack();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Approve failed.');
-    } finally {
-      setSubmitting(false);
-    }
+  const handleApprove = () => {
+    setPendingDecision('approved');
+    setSignatureEmpty(true);
+    setShowSignatureModal(true);
   };
 
   const handleEnterEditMode = (eye: 'left' | 'right') => {
@@ -663,26 +688,113 @@ function ReviewView({
     }
   };
 
-  const handleSubmit = async () => {
+  const handleSubmit = () => {
+    setPendingDecision('overridden');
+    setSignatureEmpty(true);
+    setShowSignatureModal(true);
+  };
+
+  // Compute final per-eye grades at finalize time (same logic as the old submit).
+  const computeFinalGrades = () => {
     const leftResult = aiResults.find(r => getEyeSide(r as unknown as Record<string, unknown>) === 'left');
     const rightResult = aiResults.find(r => getEyeSide(r as unknown as Record<string, unknown>) === 'right');
     const finalGradeLeft = leftConfirmed?.severity ?? leftResult?.severity_label ?? leftResult?.dr_severity ?? null;
     const finalGradeRight = rightConfirmed?.severity ?? rightResult?.severity_label ?? rightResult?.dr_severity ?? null;
-    setSubmitting(true);
+    return { finalGradeLeft, finalGradeRight };
+  };
+
+  // Step 1 → 2: capture signature, request a preview PDF (no DB write).
+  const handleSignatureConfirm = async () => {
+    const dataUrl = sigCanvasRef.current?.toDataURL('image/png') ?? null;
+    setSignatureDataUrl(dataUrl);
+    if (!dataUrl) return;
+    setFlowLoading(true);
     try {
-      await screeningsAPI.submitReview(sessionId, {
-        doctor_id: user.user_id,
-        decision: 'overridden',
-        override_reason: 'Doctor manually edited AI results for one or more eyes.',
-        final_dr_grade_left: finalGradeLeft ?? undefined,
-        final_dr_grade_right: finalGradeRight ?? undefined,
+      const blob = await screeningsAPI.reportPreview(sessionId, {
+        report_markdown: ragResult?.rag_summary ?? '',
+        signature_data_url: dataUrl,
+        patient_name: patientName,
+        doctor_name: user.name ?? null,
       });
-      toast.success('Session submitted successfully');
+      const pdfBlob = new Blob([blob], { type: 'application/pdf' });
+      setPreviewBlob(pdfBlob);
+      const arrayBuf = await pdfBlob.arrayBuffer();
+      setPreviewData({ data: new Uint8Array(arrayBuf) });
+      setPreviewPdfUrl(URL.createObjectURL(pdfBlob));
+      setShowSignatureModal(false);
+      setShowPreviewModal(true);
+    } catch {
+      toast.error('Failed to generate preview.');
+    } finally {
+      setFlowLoading(false);
+    }
+  };
+
+  // Cancel out of the signature modal — no commit, return to session view.
+  const handleSignatureCancel = () => {
+    sigCanvasRef.current?.clear();
+    setShowSignatureModal(false);
+    setSignatureEmpty(true);
+    setPendingDecision(null);
+    setSignatureDataUrl(null);
+  };
+
+  // Step 2 → 1: go back to re-sign. Keep the blob URL alive (it's only revoked
+  // at the very end, after finalize succeeds) so the preview stays viewable.
+  const handlePreviewBack = () => {
+    setShowPreviewModal(false);
+    setSignatureEmpty(true);
+    setShowSignatureModal(true);
+  };
+
+  // Step 3: the ONLY commit — status + doctor_reviews row + PDF storage + optional email.
+  const handleFinalize = async () => {
+    if (!pendingDecision) return;
+    const { finalGradeLeft, finalGradeRight } = computeFinalGrades();
+    const isOverride = leftEdited || rightEdited || reportEdited;
+    const editedThings: string[] = [];
+    if (leftEdited || rightEdited) editedThings.push('AI results');
+    if (reportEdited) editedThings.push('the clinical report');
+    setFlowLoading(true);
+    try {
+      await screeningsAPI.finalizeReview(sessionId, {
+        doctor_id: user.user_id ?? (user as unknown as { id?: string }).id ?? '',
+        decision: isOverride ? 'overridden' : 'approved',
+        override_reason: isOverride
+          ? `Doctor manually edited ${editedThings.join(' and ')}.`
+          : null,
+        final_grade_left: finalGradeLeft,
+        final_grade_right: finalGradeRight,
+        report_markdown: ragResult?.rag_summary ?? '',
+        signature_data_url: signatureDataUrl ?? '',
+        patient_name: patientName,
+        patient_email: patientEmail ?? null,
+        doctor_name: user.name ?? null,
+        send_to_patient: sendToPatient && !!patientEmail,
+      });
+      // Trigger a local download of the SAME previewed PDF.
+      if (previewPdfUrl) {
+        const safeName = patientName.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+        const now = new Date();
+        const stamp = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+        const fileName = `${safeName}_${stamp}.pdf`;
+        const a = document.createElement('a');
+        a.href = previewPdfUrl;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+      toast.success(sendToPatient ? 'Report finalized and sent to patient.' : 'Report finalized and saved.');
+      setShowFinalConfirm(false);
+      setShowPreviewModal(false);
+      setShowSignatureModal(false);
+      if (previewPdfUrl) { URL.revokeObjectURL(previewPdfUrl); setPreviewPdfUrl(null); }
       onBack();
     } catch {
-      toast.error('Failed to submit session');
+      toast.error('Failed to finalize review.');
     } finally {
-      setSubmitting(false);
+      setFlowLoading(false);
     }
   };
 
@@ -704,6 +816,7 @@ function ReviewView({
       const markdown = reportEditorRef.current?.getMarkdown() ?? '';
       await aiAPI.updateRagSummary(sessionId, markdown);
       setRagResult({ rag_summary: markdown, references: ragResult?.references ?? [] });
+      setReportEdited(true);
       setIsEditingReport(false);
       setShowSaveReportConfirm(false);
       toast.success('Clinical summary saved.');
@@ -712,22 +825,43 @@ function ReviewView({
     }
   };
 
-  const handleSendReport = async () => {
-    if (!ragResult || !patientEmail) return;
-    setSendingReport(true);
+  // Re-send the already-saved signed PDF to the patient (view-only sessions).
+  const handleResend = async () => {
+    if (!patientEmail) return;
+    setResendLoading(true);
     try {
-      const pName = session ? extractPatientName(session) : 'Patient';
-      await screeningsAPI.sendReport(sessionId, {
-        patient_email: patientEmail,
-        report_html: ragResult.rag_summary,
-        patient_name: pName,
-      });
+      await screeningsAPI.resendReport(sessionId, { patient_name: patientName, patient_email: patientEmail });
       toast.success('Report sent to patient.');
+      setShowResendConfirm(false);
     } catch {
       toast.error('Failed to send report. Please try again.');
     } finally {
-      setSendingReport(false);
-      setShowSendConfirm(false);
+      setResendLoading(false);
+    }
+  };
+
+  // Export (download) the already-saved signed PDF (view-only sessions).
+  const handleExportPdf = async () => {
+    setExportLoading(true);
+    try {
+      const data = await screeningsAPI.downloadReportPdf(sessionId);
+      const pdfBlob = new Blob([data], { type: 'application/pdf' });
+      const url = URL.createObjectURL(pdfBlob);
+      const safeName = patientName.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      const now = new Date();
+      const stamp = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+      const fileName = `${safeName}_${stamp}.pdf`;
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error('Failed to export report.');
+    } finally {
+      setExportLoading(false);
     }
   };
 
@@ -962,35 +1096,154 @@ function ReviewView({
           <hr style={{ borderColor: '#e5e7eb', margin: '16px 0' }} />
           <h3 className="text-lg font-semibold text-gray-900 mt-8 mb-4">Doctor Actions</h3>
           <div className="flex flex-wrap justify-center gap-4 mb-6">
-            {(leftEdited || rightEdited) ? (
-              <button onClick={handleSubmit} disabled={isLocked || !hasResults || submitting} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(249,115,22,0.45)' }}>
-                {submitting ? 'Submitting…' : '✍️ Submit'}
+            {isLocked ? (
+              <>
+                <button onClick={() => setShowResendConfirm(true)} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 cursor-pointer transition-all duration-200 hover:brightness-110 hover:-translate-y-1 active:translate-y-0" style={{ boxShadow: '0 8px 24px rgba(37,99,235,0.45)' }}>
+                  <Mail size={16} /> Send Report to Patient
+                </button>
+                <button onClick={handleExportPdf} disabled={exportLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 cursor-pointer transition-all duration-200 hover:-translate-y-1 active:translate-y-0" style={{ boxShadow: '0 8px 24px rgba(0,0,0,0.08)' }}>
+                  <Download size={16} /> {exportLoading ? 'Exporting…' : 'Export as PDF'}
+                </button>
+              </>
+            ) : (leftEdited || rightEdited || reportEdited) ? (
+              <button onClick={handleSubmit} disabled={!hasResults || flowLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
+                ✅ Approve
               </button>
             ) : (
-              <button onClick={handleApprove} disabled={isLocked || !hasResults || submitting} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
+              <button onClick={handleApprove} disabled={!hasResults || flowLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
                 ✅ Approve
               </button>
             )}
-            {ragResult && (
-              <button onClick={() => { if (!patientEmail) { toast.error('Patient has no email on record.'); return; } setShowSendConfirm(true); }} disabled={sendingReport} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(59,130,246,0.45)' }}>
-                <Mail size={15} /> Send Report to Patient
-              </button>
-            )}
           </div>
+          {isLocked && (
+            <div className="flex items-center justify-center gap-2 text-sm text-gray-500 mb-6">
+              This session is view-only. The review has been finalized and can no longer be edited.
+            </div>
+          )}
         </>
       )}
 
       {/* Modals */}
-      {showSendConfirm && (
+
+      {/* Step 1 — Signature */}
+      {showSignatureModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl p-6 shadow-xl w-full mx-4" style={{ maxWidth: 520 }}>
+            <div className="flex items-center gap-2 mb-3"><Pencil size={18} className="text-blue-600" /><h3 className="text-lg font-bold text-gray-900">Doctor Signature</h3></div>
+            <p className="text-sm text-gray-600 mb-4">I hereby certify that I have reviewed this clinical report and confirm the findings.</p>
+            <div className="flex justify-center mb-2">
+              <SignatureCanvas
+                ref={sigCanvasRef}
+                penColor="black"
+                canvasProps={{ width: 460, height: 180, className: 'border border-gray-300 rounded-lg bg-white' }}
+                onEnd={() => setSignatureEmpty(sigCanvasRef.current?.isEmpty() ?? true)}
+              />
+            </div>
+            <div className="flex justify-end mb-4">
+              <button onClick={() => { sigCanvasRef.current?.clear(); setSignatureEmpty(true); }} className="text-xs font-semibold text-gray-500 hover:text-gray-700 cursor-pointer">Clear</button>
+            </div>
+            <div className="flex justify-end gap-3">
+              <button onClick={handleSignatureCancel} disabled={flowLoading} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200 disabled:opacity-50" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+              <button
+                onClick={handleSignatureConfirm}
+                disabled={signatureEmpty || flowLoading}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white transition-all duration-200 ${signatureEmpty ? 'opacity-40 blur-[1px] pointer-events-none' : 'cursor-pointer hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]'}`}
+                style={{ background: '#2563eb', boxShadow: '0 8px 24px rgba(59,130,246,0.45)' }}
+              >
+                {flowLoading ? 'Generating…' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Step 2 — Preview + send choice */}
+      {showPreviewModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl p-6 shadow-xl w-full mx-4" style={{ maxWidth: 720 }}>
+            <h3 className="text-lg font-bold text-gray-900 mb-3">Report Preview</h3>
+            <div className="w-full h-[55vh] overflow-y-auto rounded-lg border border-gray-200 bg-gray-100 flex justify-center p-2">
+              {previewBlob ? (
+                <Document
+                  file={previewData}
+                  loading="Loading preview…"
+                  onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+                >
+                  {Array.from({ length: numPages }, (_, i) => (
+                    <Page
+                      key={`page_${i + 1}`}
+                      pageNumber={i + 1}
+                      width={640}
+                      renderTextLayer={false}
+                      renderAnnotationLayer={false}
+                      className="mb-4"
+                    />
+                  ))}
+                </Document>
+              ) : (
+                <div className="flex items-center justify-center text-gray-400">Loading preview…</div>
+              )}
+            </div>
+            <a
+              href={previewPdfUrl ?? ''}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-block mt-2 text-sm font-semibold text-blue-600 hover:underline"
+            >
+              Open PDF in new tab ↗
+            </a>
+            <p className="text-sm font-semibold text-gray-900 mt-4 mb-3">Send this report to the patient?</p>
+            <div className="flex flex-wrap justify-end gap-3">
+              <button onClick={handlePreviewBack} disabled={flowLoading} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200 disabled:opacity-50" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Back</button>
+              <button onClick={() => { setSendToPatient(false); setShowPreviewModal(false); setShowFinalConfirm(true); }} disabled={flowLoading} className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50" style={{ background: '#2563eb', boxShadow: '0 8px 24px rgba(59,130,246,0.45)' }}>No, just save</button>
+              <button onClick={() => { setSendToPatient(true); setShowPreviewModal(false); setShowFinalConfirm(true); }} disabled={flowLoading} className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50" style={{ background: '#16a34a', boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>Yes, send to patient</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Step 3 — Final confirmation (the only commit) */}
+      {showFinalConfirm && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-6 shadow-xl max-w-sm w-full mx-4">
-            <div className="flex items-center gap-2 mb-3"><Mail size={18} className="text-blue-600" /><h3 className="text-base font-semibold text-gray-900">Send Report to Patient</h3></div>
-            <p className="text-sm text-gray-600 mb-1">This will send the clinical summary to:</p>
-            <p className="text-sm font-semibold text-gray-900 mb-5">{patientEmail}</p>
+            <h3 className="text-lg font-bold text-gray-900 mb-3">Confirm</h3>
+            <p className="text-sm text-gray-600 mb-5">
+              {sendToPatient && patientEmail
+                ? `This will finalize the review, save the signed report, and email it to: ${patientEmail}.`
+                : sendToPatient && !patientEmail
+                ? 'No patient email on record. The report will be saved but not emailed.'
+                : 'This will finalize the review and save the signed report. No email will be sent.'}
+            </p>
             <div className="flex justify-end gap-3">
-              <button onClick={() => setShowSendConfirm(false)} disabled={sendingReport} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-600 cursor-pointer hover:bg-gray-100 transition-all duration-200 disabled:opacity-50" style={{ background: '#f3f4f6' }}>Cancel</button>
-              <button onClick={handleSendReport} disabled={sendingReport} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 disabled:opacity-60" style={{ background: '#2563eb' }}>{sendingReport ? 'Sending…' : 'Confirm & Send'}</button>
+              <button onClick={() => { setShowFinalConfirm(false); setShowPreviewModal(true); }} disabled={flowLoading} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200 disabled:opacity-50" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+              <button onClick={handleFinalize} disabled={flowLoading} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-60" style={{ background: '#16a34a', boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>{flowLoading ? 'Finalizing…' : 'Confirm'}</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* View-only — re-send saved report */}
+      {showResendConfirm && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl p-6 shadow-xl w-full mx-4" style={{ maxWidth: 480 }}>
+            <div className="flex items-center gap-2 mb-3"><Mail size={18} className="text-blue-600" /><h3 className="text-lg font-bold text-gray-900">Send Report to Patient</h3></div>
+            {patientEmail ? (
+              <>
+                <p className="text-sm text-gray-600 mb-1">This will email the saved clinical report (PDF) to:</p>
+                <p className="text-sm font-bold text-gray-900 mb-5">{patientEmail}</p>
+                <div className="flex justify-end gap-3">
+                  <button onClick={() => setShowResendConfirm(false)} disabled={resendLoading} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200 disabled:opacity-50" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Cancel</button>
+                  <button onClick={handleResend} disabled={resendLoading} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 disabled:opacity-60" style={{ background: '#2563eb', boxShadow: '0 8px 24px rgba(37,99,235,0.45)' }}>{resendLoading ? 'Sending…' : 'Confirm & Send'}</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-gray-600 mb-5">No patient email on record.</p>
+                <div className="flex justify-end">
+                  <button onClick={() => setShowResendConfirm(false)} className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-700 cursor-pointer hover:brightness-90 transition-all duration-200" style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}>Close</button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -1388,6 +1641,8 @@ export default function DoctorDashboard() {
   const [assignedSessions, setAssignedSessions] = useState<ScreeningSession[]>([]);
   const [isEditingReport, setIsEditingReport] = useState(false);
   const [showLogoLeaveConfirm, setShowLogoLeaveConfirm] = useState(false);
+  // Bumped to refetch inbox data in place when the logo is clicked while already on inbox.
+  const [mainRefreshKey, setMainRefreshKey] = useState(0);
 
   const storageKey = `visionary_doctor_cleared_${user?.user_id ?? ''}`;
   const [clearedIds, setClearedIds] = useState<Set<string>>(() => {
@@ -1411,7 +1666,7 @@ export default function DoctorDashboard() {
     screeningsAPI.getAssignedToDoctor(user.user_id)
       .then(r => setAssignedSessions(r.data ?? []))
       .catch(() => {});
-  }, [user, view.name]);
+  }, [user, view.name, mainRefreshKey]);
 
   useEffect(() => {
     if (assignedSessions.length === 0) return;
@@ -1493,6 +1748,12 @@ export default function DoctorDashboard() {
   const handleLogoClick = () => {
     if (isEditingReport) {
       setShowLogoLeaveConfirm(true);
+      return;
+    }
+    // Already on the main dashboard → refresh its data in place instead of re-navigating.
+    if (view.name === 'inbox') {
+      setSidebarQuery('');
+      setMainRefreshKey(k => k + 1);
       return;
     }
     setView({ name: 'inbox' });
@@ -1616,6 +1877,7 @@ export default function DoctorDashboard() {
         <main className="flex-1 overflow-y-auto min-w-0">
           {view.name === 'inbox' && user && (
             <InboxView
+              key={`inbox-${mainRefreshKey}`}
               user={user}
               clearedIds={clearedIds}
               onClear={handleClearSessions}
