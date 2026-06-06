@@ -52,10 +52,14 @@ class SeverityClassifierTool(BaseTool):
         worst_score = -1
         worst_condition_name = "No DR"
         for result in ai_res.data:
-            # Read defensively — doctor edits null out dr_severity.
+            # A doctor override (severity_label set, only written by PATCH
+            # /ai/result) is authoritative, so it takes precedence over the AI
+            # dr_severity. Falling back to dr_severity covers normal AI rows
+            # where severity_label is null. This keeps the worst-case picker
+            # aligned with the doctor's edit even if dr_severity is repopulated.
             severity = (
-                result.get("dr_severity")
-                or result.get("severity_label")
+                result.get("severity_label")
+                or result.get("dr_severity")
                 or "none"
             )
             score = SEVERITY_LEVELS.get(severity.lower(), 0)

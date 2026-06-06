@@ -53,25 +53,54 @@ class DiagnosticAssemblerTool(BaseTool):
         lines = []
         for result in ai_res.data:
             eye = (result.get("eye") or "").capitalize()
-            # Doctor edits null out dr_severity but keep severity_label populated.
-            is_edited = (
+            # A doctor override is the authoritative diagnosis. `disease_type`
+            # and `severity_label` are ONLY ever written by PATCH /ai/result
+            # (never by /ai/analyze), so a populated `disease_type` is the
+            # robust signal that this eye was doctor-edited — independent of
+            # whether `dr_severity`/`confidence_score` happen to still hold
+            # stale AI values (e.g. after a re-analysis). The old check keyed
+            # only off `dr_severity is None`, which silently fell back to the
+            # AI prediction (and its confidence) if those columns were ever
+            # repopulated. Keep the legacy condition as a fallback.
+            is_edited = bool(result.get("disease_type")) or (
                 result.get("dr_severity") is None
                 and result.get("severity_label") is not None
             )
-            severity = (
-                result.get("dr_severity")
-                or result.get("severity_label")
-                or "none"
-            )
-            confidence = result.get("confidence_score") or 0.0
 
             if is_edited:
-                disease_type = result.get("disease_type") or "Unknown"
-                lines.append(
-                    f"- **{eye} Eye**: {disease_type} — "
-                    f"{severity.capitalize()} *(doctor-confirmed)*"
+                # Prefer the doctor's severity_label over any lingering
+                # AI dr_severity, and never show a confidence figure.
+                disease_type = (result.get("disease_type") or "").strip()
+                detected = str(result.get("disease_detected") or "").strip().lower()
+                # A doctor can confirm "no disease" — disease_detected = "No"
+                # with empty/placeholder disease_type & severity_label. Render
+                # that as a clean clinical phrase instead of "N/A — N/a".
+                has_disease = (
+                    disease_type.lower() not in ("", "n/a", "none")
+                    and detected not in ("no", "false", "none")
                 )
+                if has_disease:
+                    severity = (
+                        result.get("severity_label")
+                        or result.get("dr_severity")
+                        or "none"
+                    )
+                    lines.append(
+                        f"- **{eye} Eye**: {disease_type} — "
+                        f"{severity.capitalize()} *(doctor-confirmed)*"
+                    )
+                else:
+                    lines.append(
+                        f"- **{eye} Eye**: No disease detected "
+                        f"*(doctor-confirmed)*"
+                    )
             else:
+                severity = (
+                    result.get("dr_severity")
+                    or result.get("severity_label")
+                    or "none"
+                )
+                confidence = result.get("confidence_score") or 0.0
                 sev_lower = severity.lower()
                 label = (
                     severity.capitalize()

@@ -495,6 +495,9 @@ def override_ai_result(ai_result_id: str, body: AIResultOverride):
         "follow_up_interval": None,
         "llm_summary": None,
         "warnings": [],
+        # Clear the raw AI prediction artifacts too — after a doctor override
+        # they are stale and must not be surfaced as the eye's diagnosis.
+        "class_probabilities": None,
     }
 
     supabase.table("ai_results").update(update_data).eq("id", ai_result_id).execute()
