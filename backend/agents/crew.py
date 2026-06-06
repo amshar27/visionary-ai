@@ -134,7 +134,18 @@ def run_clinical_report_crew(screening_session_id: str) -> dict:
     # Loop guard: revise at most once per pipeline invocation. We do NOT
     # re-audit the revised brief (no second Brief Critic run, no loop).
     writer_research_task = research_task
-    if brief_verdict.get("verdict") == "fail":
+    brief_checks = brief_verdict.get("failed_checks") or []
+    brief_should_revise = (
+        brief_verdict.get("verdict") == "fail"
+        and isinstance(brief_checks, list)
+        and len(brief_checks) > 0
+    )
+    if brief_verdict.get("verdict") == "fail" and not brief_should_revise:
+        logger.info(
+            f"[brief_critic] session={screening_session_id} "
+            f"fail with empty failed_checks treated as pass, no revision triggered"
+        )
+    if brief_should_revise:
         research_revision_task = build_research_revision_task(
             screening_session_id,
             research_task,
@@ -196,7 +207,18 @@ def run_clinical_report_crew(screening_session_id: str) -> dict:
     )
 
     # ── Phase 3 (conditional): Writer revision ────────────────────────────────
-    if verdict.get("verdict") == "fail":
+    report_checks = verdict.get("failed_checks") or []
+    report_should_revise = (
+        verdict.get("verdict") == "fail"
+        and isinstance(report_checks, list)
+        and len(report_checks) > 0
+    )
+    if verdict.get("verdict") == "fail" and not report_should_revise:
+        logger.info(
+            f"[report_critic] session={screening_session_id} "
+            f"fail with empty failed_checks treated as pass, no revision triggered"
+        )
+    if report_should_revise:
         report_revision_task = build_report_revision_task(
             screening_session_id,
             report_task,
