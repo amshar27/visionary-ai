@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Eye, EyeOff } from 'lucide-react';
 import { authAPI } from '../services/api';
+import { validatePassword, validateConfirmPassword } from '../utils/validation';
 
 type Step = 1 | 2 | 3 | 4;
 
@@ -17,6 +18,8 @@ export default function ForgotPassword() {
   const [showConfirmPw, setShowConfirmPw] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [newPasswordError, setNewPasswordError] = useState<string | null>(null);
+  const [confirmPasswordError, setConfirmPasswordError] = useState<string | null>(null);
   const [visible, setVisible] = useState(false);
   const [stepVisible, setStepVisible] = useState(true);
   const [resendCountdown, setResendCountdown] = useState(0);
@@ -127,14 +130,11 @@ export default function ForgotPassword() {
   };
 
   const handleResetPassword = async () => {
-    if (newPassword.length < 6) {
-      setError('Password must be at least 6 characters.');
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      setError('Passwords do not match.');
-      return;
-    }
+    const pwErr = validatePassword(newPassword);
+    const confirmErr = validateConfirmPassword(newPassword, confirmPassword);
+    setNewPasswordError(pwErr);
+    setConfirmPasswordError(confirmErr);
+    if (pwErr || confirmErr) return;
     setLoading(true);
     setError('');
     try {
@@ -320,7 +320,10 @@ export default function ForgotPassword() {
                   <input
                     type={showPw ? 'text' : 'password'}
                     value={newPassword}
-                    onChange={(e) => setNewPassword(e.target.value)}
+                    onChange={(e) => {
+                      setNewPassword(e.target.value);
+                      if (newPasswordError) setNewPasswordError(null);
+                    }}
                     className="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 pr-10 text-gray-900 placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all text-sm"
                     placeholder="Enter new password"
                   />
@@ -332,6 +335,7 @@ export default function ForgotPassword() {
                     {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
+                {newPasswordError && <p className="text-red-500 text-xs">{newPasswordError}</p>}
               </div>
 
               <div className="space-y-1">
@@ -340,7 +344,10 @@ export default function ForgotPassword() {
                   <input
                     type={showConfirmPw ? 'text' : 'password'}
                     value={confirmPassword}
-                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    onChange={(e) => {
+                      setConfirmPassword(e.target.value);
+                      if (confirmPasswordError) setConfirmPasswordError(null);
+                    }}
                     onKeyDown={(e) => e.key === 'Enter' && handleResetPassword()}
                     className="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 pr-10 text-gray-900 placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all text-sm"
                     placeholder="Confirm new password"
@@ -353,6 +360,7 @@ export default function ForgotPassword() {
                     {showConfirmPw ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
+                {confirmPasswordError && <p className="text-red-500 text-xs">{confirmPasswordError}</p>}
               </div>
 
               {error && <p className="text-red-500 text-sm">{error}</p>}

@@ -5,6 +5,7 @@ import toast from 'react-hot-toast';
 import { useAuth } from '../context/AuthContext';
 import { patientsAPI, screeningsAPI, uploadsAPI, aiAPI, staffAPI, appointmentsAPI } from '../services/api';
 import { formatDt, getEyeSide, fmtConfidence } from '../utils/format';
+import { validateName, validateIcPassport, validateAge, validatePhone, validateEmail } from '../utils/validation';
 import type { Patient, ScreeningSession, RetinalImage, AIResult, StaffUser, Appointment } from '../types';
 import Pagination from '../components/Pagination';
 import AppHeader from '../components/AppHeader';
@@ -182,6 +183,11 @@ function NewPatientView({
   const [allergiesText, setAllergiesText] = useState('');
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(false);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [icError, setIcError] = useState<string | null>(null);
+  const [ageError, setAgeError] = useState<string | null>(null);
+  const [contactError, setContactError] = useState<string | null>(null);
+  const [emailError, setEmailError] = useState<string | null>(null);
 
   const parseComorbidities = (text: string): string[] => {
     const items: string[] = [];
@@ -196,26 +202,17 @@ function NewPatientView({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || !ic.trim()) {
-      toast.error('Name and IC / Passport are required.');
-      return;
-    }
-    if (!age || age <= 0) {
-      toast.error('Age is required.');
-      return;
-    }
-    if (!contact.trim()) {
-      toast.error('Contact number is required.');
-      return;
-    }
-    if (!email.trim()) {
-      toast.error('Email is required.');
-      return;
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-      toast.error('Please enter a valid email address.');
-      return;
-    }
+    const nameErr = validateName(name);
+    const icErr = validateIcPassport(ic);
+    const ageErr = validateAge(age === 0 ? '' : age);
+    const contactErr = validatePhone(contact);
+    const emailErr = validateEmail(email);
+    setNameError(nameErr);
+    setIcError(icErr);
+    setAgeError(ageErr);
+    setContactError(contactErr);
+    setEmailError(emailErr);
+    if (nameErr || icErr || ageErr || contactErr || emailErr) return;
     setLoading(true);
     try {
       const payload = {
@@ -269,15 +266,18 @@ function NewPatientView({
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="text-xs mb-1 block text-gray-500">Full Name <span className="text-red-500">*</span></label>
-              <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={name} onChange={e => setName(e.target.value)} />
+              <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={name} onChange={e => { setName(e.target.value); if (nameError) setNameError(null); }} />
+              {nameError && <p className="mt-1 text-xs text-red-500">{nameError}</p>}
             </div>
             <div>
               <label className="text-xs mb-1 block text-gray-500">IC / Passport Number <span className="text-red-500">*</span></label>
-              <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={ic} onChange={e => setIc(e.target.value)} />
+              <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={ic} onChange={e => { setIc(e.target.value); if (icError) setIcError(null); }} />
+              {icError && <p className="mt-1 text-xs text-red-500">{icError}</p>}
             </div>
             <div>
               <label className="text-xs mb-1 block text-gray-500">Age <span className="text-red-500">*</span></label>
-              <input type="number" min={0} max={120} className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={age === 0 ? '' : age} onChange={e => setAge(isNaN(e.target.valueAsNumber) ? 0 : e.target.valueAsNumber)} />
+              <input type="number" min={0} max={120} className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={age === 0 ? '' : age} onChange={e => { setAge(isNaN(e.target.valueAsNumber) ? 0 : e.target.valueAsNumber); if (ageError) setAgeError(null); }} />
+              {ageError && <p className="mt-1 text-xs text-red-500">{ageError}</p>}
             </div>
             <div>
               <label className="text-xs mb-1 block text-gray-500">Sex <span className="text-red-500">*</span></label>
@@ -288,11 +288,13 @@ function NewPatientView({
             </div>
             <div className="col-span-2">
               <label className="text-xs mb-1 block text-gray-500">Contact Number <span className="text-red-500">*</span></label>
-              <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={contact} onChange={e => setContact(e.target.value)} />
+              <input className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={contact} onChange={e => { setContact(e.target.value); if (contactError) setContactError(null); }} />
+              {contactError && <p className="mt-1 text-xs text-red-500">{contactError}</p>}
             </div>
             <div className="col-span-2">
               <label className="text-xs mb-1 block text-gray-500">Email <span className="text-red-500">*</span></label>
-              <input type="email" className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={email} onChange={e => setEmail(e.target.value)} placeholder="patient@example.com" />
+              <input type="email" className="w-full px-3 py-2.5 rounded-xl text-sm outline-none" style={inputStyle} value={email} onChange={e => { setEmail(e.target.value); if (emailError) setEmailError(null); }} placeholder="patient@example.com" />
+              {emailError && <p className="mt-1 text-xs text-red-500">{emailError}</p>}
             </div>
           </div>
         </div>

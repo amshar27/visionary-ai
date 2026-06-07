@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import { Eye, EyeOff } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuth } from '../context/AuthContext';
+import { validateEmail, validateRequiredPassword } from '../utils/validation';
 import type { UserRole } from '../types';
 
 const ROLE_HOME: Record<UserRole, string> = {
@@ -25,6 +26,8 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [showPw, setShowPw] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [emailError, setEmailError] = useState<string | null>(null);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
 
   // Redirect if already logged in (mirrors Streamlit login.py top guard)
   useEffect(() => {
@@ -33,10 +36,12 @@ export default function Login() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!email.trim() || !password.trim()) {
-      toast.error('Email and password are required.');
-      return;
-    }
+    const emailErr = validateEmail(email);
+    const passwordErr = validateRequiredPassword(password);
+    setEmailError(emailErr);
+    setPasswordError(passwordErr);
+    if (emailErr || passwordErr) return;
+
     setLoading(true);
     try {
       const resp = await login({ email: email.trim().toLowerCase(), password });
@@ -69,31 +74,43 @@ export default function Login() {
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          <input
-            type="email"
-            placeholder="e.g. name@gmail.com"
-            value={email}
-            onChange={e => setEmail(e.target.value)}
-            className="w-full px-4 py-3 rounded-xl text-sm outline-none"
-            style={inputStyle}
-          />
-
-          <div className="relative">
+          <div>
             <input
-              type={showPw ? 'text' : 'password'}
-              placeholder="Your password"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-              className="w-full px-4 py-3 rounded-xl text-sm outline-none pr-10"
+              type="email"
+              placeholder="e.g. name@gmail.com"
+              value={email}
+              onChange={e => {
+                setEmail(e.target.value);
+                if (emailError) setEmailError(null);
+              }}
+              className="w-full px-4 py-3 rounded-xl text-sm outline-none"
               style={inputStyle}
             />
-            <button
-              type="button"
-              onClick={() => setShowPw(p => !p)}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
-            >
-              {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
-            </button>
+            {emailError && <p className="mt-1 text-xs text-red-500">{emailError}</p>}
+          </div>
+
+          <div>
+            <div className="relative">
+              <input
+                type={showPw ? 'text' : 'password'}
+                placeholder="Your password"
+                value={password}
+                onChange={e => {
+                  setPassword(e.target.value);
+                  if (passwordError) setPasswordError(null);
+                }}
+                className="w-full px-4 py-3 rounded-xl text-sm outline-none pr-10"
+                style={inputStyle}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPw(p => !p)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 cursor-pointer hover:bg-gray-100 transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]"
+              >
+                {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+            {passwordError && <p className="mt-1 text-xs text-red-500">{passwordError}</p>}
           </div>
 
           <div className="text-right mt-1">
