@@ -133,7 +133,8 @@ visionary_ai/
     │   ├── types/
     │   │   └── index.ts          # all TypeScript interfaces
     │   └── utils/
-    │       └── format.ts         # formatDt, getEyeSide, fmtConfidence, shortId
+    │       ├── format.ts         # formatDt, getEyeSide, fmtConfidence, shortId
+    │       └── validation.ts     # shared form-field validators (email, password, name, IC, age, phone)
     └── package.json
 ```
 
@@ -362,6 +363,13 @@ Routes are in `App.tsx`. `ProtectedRoute` redirects unauthenticated users to `/l
 | `/nurse/*` | NurseDashboard | nurse |
 | `/doctor/*` | DoctorDashboard | doctor |
 | `/admin/*` | AdminDashboard | admin |
+
+### Form validation (`utils/validation.ts`)
+Shared client-side form-field validators live in `src/utils/validation.ts`. Each function returns an **error-message string when invalid, or `null` when valid** (note: `null` = valid, the opposite of a boolean "is valid" flag). Exports: `validateEmail`, `validatePassword` (≥8 chars + upper + lower + digit + symbol), `validateRequiredPassword` (non-empty only — used on login where the full strength rules shouldn't apply), `validateConfirmPassword(pw, confirm)`, `validateName`, `validateIcPassport`, `validateAge` (integer 1–120), `validatePhone`. Consumed by `Login.tsx`, `Register.tsx`, `ForgotPassword.tsx`, `NurseDashboard.tsx` (new-patient form), and `AdminDashboard.tsx`. Added in the "input validation to auth and patient registration forms" commit.
+
+The three **Admin** forms run the same validators on submit (before the API call, returning early on the first failure via `toast.error`), matching the Register/NewPatient rules: **Update User Name** → `validateName`; **Reset User Password** → `validatePassword` + `validateConfirmPassword`; **Update Patient** → `validateName` + `validateIcPassport` + `validatePhone` (Sex is read-only and not validated). These replaced the older ad-hoc inline checks (e.g. the previous "≥6 characters" password rule is now the stronger shared `validatePassword`).
+
+**Admin confirm modals**: all five mutating admin actions — **Update User Name**, **Reset User Password**, **Delete User** (System Users tab) and **Update Patient**, **Delete Patient** (Patients tab) — now require a **Confirm/Cancel modal** before the API call fires. The modal is a lightweight in-file `ConfirmModal` (module-scope, fixed overlay + Tailwind; reused by both tabs via a single `ConfirmState` `{open, message, danger, confirmLabel, onConfirm}` state per tab and the `CLOSED_CONFIRM` constant). Destructive actions (delete user/patient) render a red Confirm button (`danger: true`); the rest use primary blue. Each handler is split: a synchronous opener runs client-side validation **first** (returns early via `toast.error` so the modal never opens on invalid input) then sets the confirm state; the actual `adminAPI` PATCH/DELETE call lives in a `do*` function passed as `onConfirm`. The two **delete** forms keep their existing "I understand…" checkbox as the **first** gate (button stays disabled until checked); the modal is a **second** confirmation that opens only after the enabled Delete button is clicked.
 
 ### Back/Forward sub-view navigation (`ViewNavArrows`)
 Both NurseDashboard and DoctorDashboard render a **browser-style back/forward arrow row** (`src/components/ViewNavArrows.tsx`) directly below `<AppHeader>`, on **every** sub-view (including Nurse `home` / Doctor `inbox`). It navigates the user's **in-app sub-view history**, independent of the router/browser history API.

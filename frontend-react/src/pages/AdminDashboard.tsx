@@ -7,6 +7,7 @@ import { adminAPI } from '../services/api';
 import type { StaffUser, Patient } from '../types';
 import AppHeader from '../components/AppHeader';
 import Pagination from '../components/Pagination';
+import { validateName, validatePassword, validateConfirmPassword, validateIcPassport, validatePhone } from '../utils/validation';
 
 const ADMIN_PAGE_SIZE = 10;
 
@@ -24,6 +25,52 @@ const cardStyle: React.CSSProperties = {
   padding: '20px 24px',
   boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.1)',
 };
+
+// ─── Confirm modal ──────────────────────────────────────────────────────────────
+
+type ConfirmState = {
+  open: boolean;
+  message: string;
+  danger: boolean;
+  confirmLabel: string;
+  onConfirm: () => void;
+};
+
+const CLOSED_CONFIRM: ConfirmState = { open: false, message: '', danger: false, confirmLabel: 'Confirm', onConfirm: () => {} };
+
+function ConfirmModal({ state, onClose }: { state: ConfirmState; onClose: () => void }) {
+  if (!state.open) return null;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center px-4"
+      style={{ background: 'rgba(15,23,42,0.45)' }}
+      onClick={onClose}
+    >
+      <div style={{ ...cardStyle, maxWidth: 420, width: '100%' }} onClick={e => e.stopPropagation()}>
+        <h3 className="text-base font-bold text-gray-900 mb-2">Please confirm</h3>
+        <p className="text-sm text-gray-600 mb-5">{state.message}</p>
+        <div className="flex justify-end gap-3">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 rounded-xl text-sm font-semibold text-gray-600 cursor-pointer hover:brightness-95 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+            style={{ background: '#f3f4f6', border: '1px solid #e5e7eb' }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => { state.onConfirm(); onClose(); }}
+            className="px-4 py-2 rounded-xl text-sm font-bold text-white cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
+            style={state.danger
+              ? { background: '#dc2626', border: '1px solid #b91c1c' }
+              : { background: '#2563eb', border: '1px solid #1d4ed8' }}
+          >
+            {state.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ─── Role badge ───────────────────────────────────────────────────────────────
 
@@ -62,6 +109,9 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
   const [deleteStaffId, setDeleteStaffId] = useState('');
   const [confirmDel, setConfirmDel] = useState(false);
 
+  // Confirmation modal
+  const [confirm, setConfirm] = useState<ConfirmState>(CLOSED_CONFIRM);
+
   const load = () => {
     setLoading(true);
     adminAPI.getStaffUsers(requesterRole)
@@ -97,8 +147,18 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
     if (updateRow) setUpdateName(updateRow.name ?? '');
   }, [updateStaffId]);
 
-  const handleUpdateName = async () => {
-    if (!updateName.trim()) { toast.error('Name cannot be empty.'); return; }
+  const handleUpdateName = () => {
+    const nameErr = validateName(updateName); if (nameErr) { toast.error(nameErr); return; }
+    setConfirm({
+      open: true,
+      danger: false,
+      confirmLabel: 'Confirm',
+      message: `Update name for ${updateStaffId} (${updateRow?.email ?? '-'}) to "${updateName.trim()}"?`,
+      onConfirm: doUpdateName,
+    });
+  };
+
+  const doUpdateName = async () => {
     try {
       await adminAPI.updateStaffName(updateStaffId, { requester_role: requesterRole, name: updateName.trim() });
       toast.success(`User updated (Staff ID: ${updateStaffId}).`);
@@ -108,10 +168,19 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
     }
   };
 
-  const handleResetPassword = async () => {
-    if (!newPw || !confirmPw) { toast.error('Please fill in both password fields.'); return; }
-    if (newPw !== confirmPw) { toast.error('Passwords do not match.'); return; }
-    if (newPw.trim().length < 6) { toast.error('Password must be at least 6 characters.'); return; }
+  const handleResetPassword = () => {
+    const pwErr = validatePassword(newPw); if (pwErr) { toast.error(pwErr); return; }
+    const confirmErr = validateConfirmPassword(newPw, confirmPw); if (confirmErr) { toast.error(confirmErr); return; }
+    setConfirm({
+      open: true,
+      danger: false,
+      confirmLabel: 'Confirm',
+      message: `Reset password for ${resetStaffId} (${resetRow?.email ?? '-'})? The user will need the new password to log in.`,
+      onConfirm: doResetPassword,
+    });
+  };
+
+  const doResetPassword = async () => {
     try {
       await adminAPI.resetStaffPassword(resetStaffId, { requester_role: requesterRole, new_password: newPw.trim() });
       toast.success(`Password reset (Staff ID: ${resetStaffId}).`);
@@ -121,7 +190,17 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
     }
   };
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
+    setConfirm({
+      open: true,
+      danger: true,
+      confirmLabel: 'Delete User',
+      message: `Permanently delete the login account for ${deleteStaffId} (${deleteRow?.email ?? '-'})? This cannot be undone.`,
+      onConfirm: doDelete,
+    });
+  };
+
+  const doDelete = async () => {
     try {
       await adminAPI.deleteStaffUser(deleteStaffId, { requester_role: requesterRole });
       toast.success(`User deleted (Staff ID: ${deleteStaffId}).`);
@@ -254,6 +333,8 @@ function StaffUsersTab({ requesterRole }: { requesterRole: string }) {
           <Trash2 size={14} /> Delete User
         </button>
       </div>
+
+      <ConfirmModal state={confirm} onClose={() => setConfirm(CLOSED_CONFIRM)} />
     </div>
   );
 }
@@ -275,6 +356,9 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
   // Delete form
   const [deleteIc, setDeleteIc] = useState('');
   const [confirmDel, setConfirmDel] = useState(false);
+
+  // Confirmation modal
+  const [confirm, setConfirm] = useState<ConfirmState>(CLOSED_CONFIRM);
 
   const load = () => {
     setLoading(true);
@@ -313,10 +397,20 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
     }
   }, [updateIc]);
 
-  const handleUpdate = async () => {
-    if (!updateName.trim()) { toast.error('Name cannot be empty.'); return; }
-    if (!updateIcVal.trim()) { toast.error('IC/Passport cannot be empty.'); return; }
-    if (!updateContact.trim()) { toast.error('Contact number cannot be empty.'); return; }
+  const handleUpdate = () => {
+    const nameErr = validateName(updateName); if (nameErr) { toast.error(nameErr); return; }
+    const icErr = validateIcPassport(updateIcVal); if (icErr) { toast.error(icErr); return; }
+    const phoneErr = validatePhone(updateContact); if (phoneErr) { toast.error(phoneErr); return; }
+    setConfirm({
+      open: true,
+      danger: false,
+      confirmLabel: 'Confirm',
+      message: `Save changes to patient ${updateName.trim()} (IC: ${updateIcVal.trim()})?`,
+      onConfirm: doUpdate,
+    });
+  };
+
+  const doUpdate = async () => {
     try {
       await adminAPI.updatePatientByIC(updateIc, {
         requester_role: requesterRole,
@@ -331,7 +425,17 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
     }
   };
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
+    setConfirm({
+      open: true,
+      danger: true,
+      confirmLabel: 'Delete Patient',
+      message: `Permanently delete patient ${deletePatient?.name ?? '-'} (IC: ${deleteIc})? This may affect related screening sessions and history.`,
+      onConfirm: doDelete,
+    });
+  };
+
+  const doDelete = async () => {
     try {
       await adminAPI.deletePatientByIC(deleteIc, { requester_role: requesterRole });
       toast.success(`Patient deleted (IC: ${deleteIc}).`);
@@ -454,6 +558,8 @@ function PatientsTab({ requesterRole }: { requesterRole: string }) {
           <Trash2 size={14} /> Delete Patient
         </button>
       </div>
+
+      <ConfirmModal state={confirm} onClose={() => setConfirm(CLOSED_CONFIRM)} />
     </div>
   );
 }
