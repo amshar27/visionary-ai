@@ -136,6 +136,7 @@ def send_clinical_report(
     report_html: str,
     session_id: str,
     pdf_bytes: bytes | None = None,
+    attachments: list[tuple[str, bytes]] | None = None,
 ) -> bool:
     report_date = datetime.now(KL_TZ).strftime("%d %B %Y")
 
@@ -164,7 +165,11 @@ def send_clinical_report(
         "html": html,
     }
 
-    if pdf_bytes:
+    if attachments:
+        payload["attachments"] = [
+            {"filename": fn, "content": list(b)} for fn, b in attachments
+        ]
+    elif pdf_bytes:
         safe_name = re.sub(r'[^a-zA-Z0-9]+', '_', patient_name).strip('_')
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
         attachment_filename = f"{safe_name}_{stamp}.pdf"

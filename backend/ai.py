@@ -1037,6 +1037,19 @@ def generate_rag_summary_crew(screening_session_id: UUID):
         cleaned = (result.get("rag_summary") or "").strip()
         references = result.get("references") or []
 
+        # Persist the generated summary so it survives reload (mirrors the
+        # update_rag_summary write: UPDATE existing ai_results row(s) for the
+        # session, last-write-wins). getRagSummary reads the same row(s).
+        if cleaned:
+            try:
+                supabase.table("ai_results").update(
+                    {"rag_summary": cleaned}
+                ).eq("screening_session_id", str(screening_session_id)).execute()
+            except Exception as save_err:
+                logger.warning(
+                    f"Failed to persist rag_summary for session {screening_session_id}: {save_err}"
+                )
+
         return {"rag_summary": cleaned, "references": references}
 
     except Exception as e:

@@ -1,9 +1,10 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, Literal
+from typing import Optional, Literal, Any, List, Dict
 from uuid import UUID
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from io import BytesIO
 
 import re
@@ -12,7 +13,7 @@ import requests
 
 from .db import supabase
 from .notification_service import send_clinical_report
-from .pdf_service import generate_report_pdf
+from .pdf_service import generate_report_pdf, generate_mc_pdf
 
 router = APIRouter(prefix="/screenings", tags=["screenings"])
 
@@ -381,6 +382,7 @@ def send_report_to_patient(session_id: UUID, payload: SendReportRequest):
 # Bucket for finalized report PDFs
 # ============================================================
 REPORTS_BUCKET = "reports"
+MC_BUCKET = "medical-certificates"
 
 
 class ReportPreviewRequest(BaseModel):
@@ -388,6 +390,13 @@ class ReportPreviewRequest(BaseModel):
     signature_data_url: str
     patient_name: str
     doctor_name: Optional[str] = None
+
+    # Doctor's Clinical Assessment fields
+    physical_exam: Optional[Dict[str, Any]] = None
+    prescription: Optional[List[Dict[str, Any]]] = None
+    clinical_impression: Optional[str] = None
+    management_plan: Optional[str] = None
+    follow_up_interval: Optional[str] = None
 
 
 class FinalizeReviewRequest(BaseModel):
@@ -403,6 +412,31 @@ class FinalizeReviewRequest(BaseModel):
     doctor_name: Optional[str] = None
     send_to_patient: bool
 
+    # Doctor's Clinical Assessment fields
+    physical_exam: Optional[Dict[str, Any]] = None
+    prescription: Optional[List[Dict[str, Any]]] = None
+    clinical_impression: Optional[str] = None
+    management_plan: Optional[str] = None
+    follow_up_interval: Optional[str] = None
+
+    # Medical Certificate fields
+    mc_issue: bool = False
+    mc_days: Optional[int] = None
+    mc_date_from: Optional[str] = None
+    mc_date_to: Optional[str] = None
+    mc_reason: Optional[str] = None
+
+
+class MCPreviewRequest(BaseModel):
+    patient_name: str
+    ic_passport: Optional[str] = None
+    days: Optional[int] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    reason: Optional[str] = None
+    signature_data_url: str
+    doctor_name: Optional[str] = None
+
 
 # ------------------------------------------------------------
 # Preview the signed report PDF (NO database writes)
@@ -416,6 +450,11 @@ def report_preview(session_id: UUID, payload: ReportPreviewRequest):
             payload.report_markdown,
             payload.signature_data_url,
             payload.doctor_name,
+            physical_exam=payload.physical_exam,
+            prescription=payload.prescription,
+            clinical_impression=payload.clinical_impression,
+            management_plan=payload.management_plan,
+            follow_up_interval=payload.follow_up_interval,
         )
         return StreamingResponse(
             BytesIO(pdf_bytes),
@@ -424,6 +463,37 @@ def report_preview(session_id: UUID, payload: ReportPreviewRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate preview PDF: {e}")
+
+
+# ------------------------------------------------------------
+# Preview the MC PDF (NO database writes — Option A).
+# Uses placeholder cert no "PREVIEW"; the real 5-digit number is only
+# stamped at finalize. Mirrors report-preview.
+# POST /screenings/sessions/{session_id}/mc-preview
+# ------------------------------------------------------------
+@router.post("/sessions/{session_id}/mc-preview")
+def mc_preview(session_id: UUID, payload: MCPreviewRequest):
+    try:
+        mc_date = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).strftime("%Y-%m-%d")
+        pdf_bytes = generate_mc_pdf(
+            "PREVIEW",  # placeholder — preview writes nothing, no real number yet
+            mc_date,
+            payload.patient_name,
+            payload.ic_passport or "",
+            payload.days,
+            payload.date_from,
+            payload.date_to,
+            payload.reason,
+            signature_data_url=payload.signature_data_url,
+            doctor_name=payload.doctor_name,
+        )
+        return StreamingResponse(
+            BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": 'inline; filename="mc_preview.pdf"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate MC preview PDF: {e}")
 
 
 # ------------------------------------------------------------
@@ -442,6 +512,11 @@ def finalize_review(session_id: UUID, payload: FinalizeReviewRequest):
             payload.report_markdown,
             payload.signature_data_url,
             payload.doctor_name,
+            physical_exam=payload.physical_exam,
+            prescription=payload.prescription,
+            clinical_impression=payload.clinical_impression,
+            management_plan=payload.management_plan,
+            follow_up_interval=payload.follow_up_interval,
         )
 
         # 2) Upload PDF to the `reports` bucket (mirror retinal-scans pattern)
@@ -469,22 +544,112 @@ def finalize_review(session_id: UUID, payload: FinalizeReviewRequest):
             "final_grade_right": payload.final_grade_right,
             "override_reason": payload.override_reason,
             "report_url": report_url,
+            # Doctor's Clinical Assessment
+            "physical_exam": payload.physical_exam,
+            "prescription": payload.prescription,
+            "clinical_impression": payload.clinical_impression,
+            "management_plan": payload.management_plan,
+            "follow_up_interval": payload.follow_up_interval,
         }
         supabase.table("doctor_reviews").insert(insert_data).execute()
 
-        # 5) Optionally email the PDF to the patient
+        # 5) Optionally generate + store a Medical Certificate (gated on mc_issue)
+        mc_url = None
+        mc_bytes = None
+        if payload.mc_issue:
+            try:
+                # 5a) Resolve patient identity from the DB (never trust the client)
+                sess_res = (
+                    supabase.table("screening_sessions")
+                    .select("patient_id")
+                    .eq("id", sid)
+                    .single()
+                    .execute()
+                )
+                patient_id = (sess_res.data or {}).get("patient_id")
+                if not patient_id:
+                    raise HTTPException(status_code=404, detail="Patient not found for this session")
+
+                pat_res = (
+                    supabase.table("patients")
+                    .select("name, ic_passport")
+                    .eq("id", patient_id)
+                    .single()
+                    .execute()
+                )
+                patient = pat_res.data or {}
+                mc_patient_name = patient.get("name") or payload.patient_name
+                ic_passport = patient.get("ic_passport") or ""
+
+                # 5b) Insert the MC row first to obtain the serial mc_number + id
+                mc_insert = (
+                    supabase.table("mc_certificates")
+                    .insert({
+                        "screening_session_id": sid,
+                        "patient_id": patient_id,
+                        "doctor_id": str(payload.doctor_id),
+                        "days": payload.mc_days,
+                        "date_from": payload.mc_date_from,
+                        "date_to": payload.mc_date_to,
+                        "reason": payload.mc_reason,
+                    })
+                    .execute()
+                )
+                mc_row = (mc_insert.data or [None])[0]
+                if not mc_row:
+                    raise HTTPException(status_code=500, detail="Failed to create MC record")
+                mc_id = mc_row.get("id")
+                mc_number = mc_row.get("mc_number")
+
+                # 5c) Generate the MC PDF (KL-local date, never naive)
+                certificate_no = f"{int(mc_number):05d}"
+                mc_date = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).strftime("%Y-%m-%d")
+                mc_bytes = generate_mc_pdf(
+                    certificate_no,
+                    mc_date,
+                    mc_patient_name,
+                    ic_passport,
+                    payload.mc_days,
+                    payload.mc_date_from,
+                    payload.mc_date_to,
+                    payload.mc_reason,
+                    signature_data_url=payload.signature_data_url,
+                    doctor_name=payload.doctor_name,
+                )
+
+                # 5d) Upload to the medical-certificates bucket, then save mc_url
+                mc_path = f"{mc_id}.pdf"
+                mc_storage = supabase.storage.from_(MC_BUCKET)
+                mc_storage.upload(
+                    mc_path,
+                    mc_bytes,
+                    file_options={"content-type": "application/pdf", "upsert": "true"},
+                )
+                mc_url = mc_storage.get_public_url(mc_path)
+                supabase.table("mc_certificates").update({"mc_url": mc_url}).eq("id", mc_id).execute()
+            except HTTPException:
+                raise
+            except Exception as mc_err:
+                raise HTTPException(status_code=500, detail=f"Failed to generate medical certificate: {mc_err}")
+
+        # 6) Optionally email the report (+ MC) to the patient as ONE email
         emailed = False
         if payload.send_to_patient and payload.patient_email:
+            safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", payload.patient_name).strip("_")
+            stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+            attachments = [(f"{safe_name}_{stamp}_report.pdf", pdf_bytes)]
+            if mc_bytes is not None:
+                attachments.append((f"{safe_name}_{stamp}_MC.pdf", mc_bytes))
             emailed = send_clinical_report(
                 payload.patient_name,
                 payload.patient_email,
                 payload.report_markdown,
                 sid,
-                pdf_bytes=pdf_bytes,
+                attachments=attachments,
             )
 
-        # 6) Return result
-        return {"success": True, "report_url": report_url, "emailed": emailed}
+        # 7) Return result
+        return {"success": True, "report_url": report_url, "emailed": emailed, "mc_url": mc_url}
 
     except HTTPException:
         raise
@@ -578,6 +743,68 @@ def download_report_pdf(session_id: UUID):
             BytesIO(r.content),
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="report_{sid}.pdf"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------------------------------------------------
+# Latest Medical Certificate for a session (read-only display).
+# GET /screenings/sessions/{session_id}/mc-certificate/latest
+# ------------------------------------------------------------
+@router.get("/sessions/{session_id}/mc-certificate/latest")
+def get_latest_mc(session_id: UUID):
+    try:
+        sid = str(session_id)
+        res = (
+            supabase.table("mc_certificates")
+            .select("*")
+            .eq("screening_session_id", sid)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest = _first(res.data or [])
+        return {"ok": True, "data": latest}  # can be None
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------------------------------------------------
+# Download the ALREADY-SAVED MC PDF (view-only export).
+# Mirrors report-pdf. GET /screenings/sessions/{session_id}/mc-pdf
+# ------------------------------------------------------------
+@router.get("/sessions/{session_id}/mc-pdf")
+def download_mc_pdf(session_id: UUID):
+    try:
+        sid = str(session_id)
+
+        # Latest MC row for this session
+        mc_res = (
+            supabase.table("mc_certificates")
+            .select("mc_url")
+            .eq("screening_session_id", sid)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        latest = _first(mc_res.data or [])
+        mc_url = latest.get("mc_url") if latest else None
+        if not mc_url:
+            raise HTTPException(status_code=404, detail="No saved MC found")
+
+        # Download the stored PDF bytes
+        r = requests.get(mc_url)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch stored MC")
+
+        return StreamingResponse(
+            BytesIO(r.content),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="mc_{sid}.pdf"'},
         )
 
     except HTTPException:

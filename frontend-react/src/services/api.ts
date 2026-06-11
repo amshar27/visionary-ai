@@ -158,10 +158,32 @@ export const screeningsAPI = {
       signature_data_url: string;
       patient_name: string;
       doctor_name: string | null;
+      physical_exam?: Record<string, unknown> | null;
+      prescription?: Record<string, unknown>[] | null;
+      clinical_impression?: string | null;
+      management_plan?: string | null;
+      follow_up_interval?: string | null;
     }
   ) =>
     api
       .post(`/screenings/sessions/${sessionId}/report-preview`, payload, { responseType: 'blob' })
+      .then((r) => r.data),
+
+  mcPreview: (
+    sessionId: string,
+    payload: {
+      patient_name: string;
+      ic_passport?: string | null;
+      days?: number | null;
+      date_from?: string | null;
+      date_to?: string | null;
+      reason?: string | null;
+      signature_data_url: string;
+      doctor_name?: string | null;
+    }
+  ) =>
+    api
+      .post(`/screenings/sessions/${sessionId}/mc-preview`, payload, { responseType: 'blob' })
       .then((r) => r.data),
 
   finalizeReview: (
@@ -178,6 +200,16 @@ export const screeningsAPI = {
       patient_email: string | null;
       doctor_name: string | null;
       send_to_patient: boolean;
+      physical_exam?: Record<string, unknown> | null;
+      prescription?: Record<string, unknown>[] | null;
+      clinical_impression?: string | null;
+      management_plan?: string | null;
+      follow_up_interval?: string | null;
+      mc_issue?: boolean;
+      mc_days?: number | null;
+      mc_date_from?: string | null;
+      mc_date_to?: string | null;
+      mc_reason?: string | null;
     }
   ) =>
     api
@@ -189,6 +221,12 @@ export const screeningsAPI = {
 
   downloadReportPdf: (sessionId: string) =>
     api.get(`/screenings/sessions/${sessionId}/report-pdf`, { responseType: 'blob' }).then(r => r.data),
+
+  downloadMcPdf: (sessionId: string) =>
+    api.get(`/screenings/sessions/${sessionId}/mc-pdf`, { responseType: 'blob' }).then(r => r.data),
+
+  getLatestMc: (sessionId: string) =>
+    api.get(`/screenings/sessions/${sessionId}/mc-certificate/latest`).then(r => r.data),
 };
 
 // ─── Uploads API ──────────────────────────────────────────────────────────────

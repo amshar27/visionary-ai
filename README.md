@@ -11,10 +11,11 @@ A clinical-grade multi-disease retinal screening system built for Malaysian heal
 | Backend | FastAPI (Python), uvicorn, port **8000** |
 | Frontend | React 19 + TypeScript (Vite), port **5173** |
 | Database | Supabase (PostgreSQL + Object Storage + pgvector) |
-| AI Model | PyTorch — ResNet152 + MultiheadAttention, 5 DR classes, Grad-CAM heatmaps |
+| AI Model | PyTorch — ResNet152 + MultiheadAttention, 7 classes (DR severity, cataract, glaucoma), Grad-CAM heatmaps |
 | LLM / RAG | GPT-4o-mini (per-eye summaries), GPT-4o (full clinical report), LangChain + Supabase vector store |
-| Multi-Agent Pipeline | CrewAI — Researcher (gpt-4o-mini) + Writer (gpt-4o) |
-| Email | Resend — appointment confirmation, 24-hour reminder, clinical report delivery |
+| Multi-Agent Pipeline | CrewAI — four agents: Researcher (gpt-4o-mini) + Brief Critic (gpt-4o-mini) + Writer (gpt-4o) + Report Critic (gpt-4o-mini), with two conditional revision loops |
+| PDF generation | xhtml2pdf — signed clinical report + bilingual medical certificate, with a repeating per-page disclaimer footer |
+| Email | Resend — appointment confirmation, 24-hour reminder, clinical report (PDF attachment) delivery |
 
 ---
 
@@ -69,9 +70,9 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 ### Doctor
 1. View assigned sessions in the inbox
 2. Inspect AI results and Grad-CAM heatmaps
-3. Generate a clinical report via a CrewAI multi-agent pipeline (Researcher + Writer agents)
-4. Approve or override the AI findings
-5. Send the report to the patient via email
+3. Generate a clinical report via a CrewAI multi-agent pipeline (Researcher → Brief Critic → Writer → Report Critic, with conditional revision loops)
+4. Edit AI findings per-eye and the report inline (TipTap), and document a clinical assessment (physical exam, impression, prescription)
+5. Sign the report (canvas signature), preview the generated PDF, then finalise — the signed PDF is stored and emailed to the patient, optionally with a medical certificate
 
 ### Admin
 - Manage staff accounts (create, update name/password, delete)
@@ -90,12 +91,14 @@ visionary_ai/
 │   ├── patients.py              # Patient CRUD
 │   ├── screenings.py            # Screening session workflow
 │   ├── uploads.py               # Retinal image upload
-│   ├── ai.py                    # AI inference, Grad-CAM, RAG report
+│   ├── ai.py                    # AI inference, Grad-CAM, multi-agent RAG report
 │   ├── staff.py                 # Doctor listing
 │   ├── admin.py                 # Admin staff/patient management
 │   ├── appointments.py          # Appointment booking
 │   ├── scheduler.py             # APScheduler jobs (reminders, no-show)
 │   ├── notification_service.py  # Resend email helpers
+│   ├── pdf_service.py           # Clinical report + medical certificate PDF generation
+│   ├── agents/                  # CrewAI four-agent RAG pipeline (researcher, critics, writer)
 │   └── model/
 │       └── best_model.pth       # Trained PyTorch model weights
 ├── frontend-react/
@@ -148,4 +151,5 @@ pending → assigned → analysed → approved
 
 - Auth uses bcrypt with no JWT — the user object is stored in `localStorage` under key `visionary_user`.
 - CORS is set for `http://localhost:5173` and `http://127.0.0.1:5173`. Restart uvicorn after any CORS changes.
+- The clinical report PDF (`pdf_service.py`) renders the on-screen disclaimer in a **pisa repeating static frame**, so it prints at the bottom of every page; the same disclaimer remains visible on the on-screen AI Clinical Summary card but is stripped from the PDF body to avoid duplication.
 - Full architecture reference, database schema, API routes, UI conventions, and known issues are documented in [CLAUDE.md](./CLAUDE.md).

@@ -9,6 +9,7 @@ import { formatDt, getEyeSide, fmtConfidence } from '../utils/format';
 import type { ScreeningSession, RetinalImage, AIResult, DoctorReview, RAGSummaryResponse, Appointment, Patient } from '../types';
 import type { User } from '../types';
 import RagReportEditor, { type RagReportEditorHandle } from '../components/RagReportEditor';
+import DoctorClinicalAssessment, { type AssessmentData, initialAssessmentData, resolveCondition } from '../components/DoctorClinicalAssessment';
 import Pagination from '../components/Pagination';
 import AppHeader from '../components/AppHeader';
 import ViewNavArrows from '../components/ViewNavArrows';
@@ -544,14 +545,18 @@ function ReviewView({
   const [flowLoading, setFlowLoading] = useState(false);
   const sigCanvasRef = useRef<SignatureCanvas | null>(null);
   const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
-  const [previewBlob, setPreviewBlob] = useState<Blob | null>(null);
-  const [previewData, setPreviewData] = useState<{ data: Uint8Array } | null>(null);
   const [numPages, setNumPages] = useState<number>(0);
+
+  // ── MC preview (Option A: no DB write; placeholder cert no) ──
+  const [mcPreviewUrl, setMcPreviewUrl] = useState<string | null>(null);
+  const [mcNumPages, setMcNumPages] = useState<number>(0);
+  const [previewTab, setPreviewTab] = useState<'report' | 'mc'>('report');
 
   // ── View-only resend (re-email the already-saved signed PDF) ──
   const [showResendConfirm, setShowResendConfirm] = useState(false);
   const [resendLoading, setResendLoading] = useState(false);
   const [exportLoading, setExportLoading] = useState(false);
+  const [exportMcLoading, setExportMcLoading] = useState(false);
 
   const [leftEditing, setLeftEditing] = useState(false);
   const [rightEditing, setRightEditing] = useState(false);
@@ -568,19 +573,25 @@ function ReviewView({
   const [showOverrideConfirm, setShowOverrideConfirm] = useState(false);
   const [pendingConfirmEye, setPendingConfirmEye] = useState<'left' | 'right' | null>(null);
 
+  // ── Doctor's Clinical Assessment ──
+  const [assessment, setAssessment] = useState<AssessmentData>(initialAssessmentData);
+  const [mcRow, setMcRow] = useState<Record<string, unknown> | null>(null);
+
   const load = async () => {
     try {
-      const [sResp, imgResp, aiResp, reviewResp, ragResp] = await Promise.all([
+      const [sResp, imgResp, aiResp, reviewResp, ragResp, mcResp] = await Promise.all([
         screeningsAPI.getById(sessionId),
         uploadsAPI.getBySession(sessionId),
         aiAPI.getResultsBySession(sessionId),
         screeningsAPI.getLatestReview(sessionId),
         aiAPI.getRagSummary(sessionId),
+        screeningsAPI.getLatestMc(sessionId),
       ]);
       setSession(sResp.data ?? null);
       setImages(imgResp.data ?? []);
       setAiResults(aiResp.data ?? []);
       setLatestReview(reviewResp.data ?? null);
+      setMcRow(mcResp.data ?? null);
       if (ragResp.rag_summary) {
         setRagResult({ rag_summary: ragResp.rag_summary, references: [] });
       }
@@ -613,6 +624,12 @@ function ReviewView({
     setSignatureDataUrl(null);
     setShowResendConfirm(false);
     setResendLoading(false);
+    setAssessment(initialAssessmentData);
+    setMcRow(null);
+    setMcNumPages(0);
+    setPreviewTab('report');
+    setExportMcLoading(false);
+    setMcPreviewUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
     setPreviewPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
   }, [sessionId, refreshKey]);
 
@@ -625,7 +642,41 @@ function ReviewView({
   const leftRes = aiResults.filter(r => getEyeSide(r as unknown as Record<string, unknown>) === 'left').sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null;
   const rightRes = aiResults.filter(r => getEyeSide(r as unknown as Record<string, unknown>) === 'right').sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null;
 
+  const handleAssessmentChange = (next: AssessmentData) => {
+    setAssessment(next);
+  };
+
+  // Read-only assessment reconstructed from the locked doctor_reviews row.
+  const savedAssessment: AssessmentData = useMemo(() => {
+    const lr = latestReview as unknown as Record<string, unknown> | null;
+    if (!lr) return initialAssessmentData;
+    const physical = (lr.physical_exam as Partial<AssessmentData>) ?? {};
+    return {
+      ...initialAssessmentData,
+      ...physical,
+      left: { ...initialAssessmentData.left, ...(physical.left ?? {}) },
+      right: { ...initialAssessmentData.right, ...(physical.right ?? {}) },
+      clinical_impression: (lr.clinical_impression as string) ?? physical.clinical_impression ?? '',
+      prescription: (lr.prescription as AssessmentData['prescription']) ?? physical.prescription ?? [],
+    };
+  }, [latestReview]);
+
+  // Lenient approve gate — condition-aware, returns first error message or null.
+  const assessmentGateError = (): string | null => {
+    const conds = [resolveCondition(leftRes), resolveCondition(rightRes)];
+    const needIOP = conds.includes('Glaucoma');
+    const needVA = conds.includes('DR') || conds.includes('Cataract');
+    if (needIOP && !assessment.left.iop && !assessment.right.iop) return 'Enter IOP (at least one eye) for glaucoma assessment.';
+    if (needVA && !assessment.left.visual_acuity && !assessment.right.visual_acuity) return 'Enter Visual Acuity (at least one eye).';
+    if (!assessment.clinical_impression.trim()) return 'Clinical Impression is required.';
+    if (assessment.mc.enabled && (!assessment.mc.days || !assessment.mc.date_from || !assessment.mc.date_to || !assessment.mc.reason.trim())) return 'Complete all MC fields (days, from, to, reason).';
+    return null;
+  };
+  const assessmentError = ragResult && !isLocked ? assessmentGateError() : null;
+
   const handleApprove = () => {
+    const err = assessmentGateError();
+    if (err) { toast.error(err); return; }
     setPendingDecision('approved');
     setSignatureEmpty(true);
     setShowSignatureModal(true);
@@ -689,6 +740,8 @@ function ReviewView({
   };
 
   const handleSubmit = () => {
+    const err = assessmentGateError();
+    if (err) { toast.error(err); return; }
     setPendingDecision('overridden');
     setSignatureEmpty(true);
     setShowSignatureModal(true);
@@ -715,12 +768,31 @@ function ReviewView({
         signature_data_url: dataUrl,
         patient_name: patientName,
         doctor_name: user.name ?? null,
+        physical_exam: { left: assessment.left, right: assessment.right, other_findings: assessment.other_findings },
+        prescription: assessment.prescription,
+        clinical_impression: assessment.clinical_impression,
       });
       const pdfBlob = new Blob([blob], { type: 'application/pdf' });
-      setPreviewBlob(pdfBlob);
-      const arrayBuf = await pdfBlob.arrayBuffer();
-      setPreviewData({ data: new Uint8Array(arrayBuf) });
       setPreviewPdfUrl(URL.createObjectURL(pdfBlob));
+
+      // If an MC is being issued, also fetch its preview (placeholder cert no).
+      if (assessment.mc.enabled) {
+        const mcBlob = await screeningsAPI.mcPreview(sessionId, {
+          patient_name: patientName,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ic_passport: (session as any)?.patients?.ic_passport ?? null,
+          days: assessment.mc.days ? Number(assessment.mc.days) : null,
+          date_from: assessment.mc.date_from || null,
+          date_to: assessment.mc.date_to || null,
+          reason: assessment.mc.reason || null,
+          signature_data_url: dataUrl,
+          doctor_name: user.name ?? null,
+        });
+        const mcPdfBlob = new Blob([mcBlob], { type: 'application/pdf' });
+        setMcPreviewUrl(URL.createObjectURL(mcPdfBlob));
+      }
+
+      setPreviewTab('report');
       setShowSignatureModal(false);
       setShowPreviewModal(true);
     } catch {
@@ -771,25 +843,37 @@ function ReviewView({
         patient_email: patientEmail ?? null,
         doctor_name: user.name ?? null,
         send_to_patient: sendToPatient && !!patientEmail,
+        physical_exam: { left: assessment.left, right: assessment.right, other_findings: assessment.other_findings },
+        prescription: assessment.prescription,
+        clinical_impression: assessment.clinical_impression,
+        mc_issue: assessment.mc.enabled,
+        mc_days: assessment.mc.enabled && assessment.mc.days !== '' ? Number(assessment.mc.days) : null,
+        mc_date_from: assessment.mc.enabled ? (assessment.mc.date_from || null) : null,
+        mc_date_to: assessment.mc.enabled ? (assessment.mc.date_to || null) : null,
+        mc_reason: assessment.mc.enabled ? (assessment.mc.reason || null) : null,
       });
-      // Trigger a local download of the SAME previewed PDF.
-      if (previewPdfUrl) {
-        const safeName = patientName.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-        const now = new Date();
-        const stamp = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
-        const fileName = `${safeName}_${stamp}.pdf`;
+      // Trigger a local download of the SAME previewed PDF(s).
+      const safeName = patientName.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      const now = new Date();
+      const stamp = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+      const triggerDownload = (url: string, fileName: string) => {
         const a = document.createElement('a');
-        a.href = previewPdfUrl;
+        a.href = url;
         a.download = fileName;
         document.body.appendChild(a);
         a.click();
         a.remove();
-      }
+      };
+      if (previewPdfUrl) triggerDownload(previewPdfUrl, `${safeName}_${stamp}.pdf`);
+      // NOTE: the MC auto-download is the PREVIEW copy (placeholder cert no).
+      // The authoritative MC with the real cert no lives in the bucket (Export MC).
+      if (mcPreviewUrl) triggerDownload(mcPreviewUrl, `${safeName}_${stamp}_MC.pdf`);
       toast.success(sendToPatient ? 'Report finalized and sent to patient.' : 'Report finalized and saved.');
       setShowFinalConfirm(false);
       setShowPreviewModal(false);
       setShowSignatureModal(false);
       if (previewPdfUrl) { URL.revokeObjectURL(previewPdfUrl); setPreviewPdfUrl(null); }
+      if (mcPreviewUrl) { URL.revokeObjectURL(mcPreviewUrl); setMcPreviewUrl(null); }
       onBack();
     } catch {
       toast.error('Failed to finalize review.');
@@ -862,6 +946,31 @@ function ReviewView({
       toast.error('Failed to export report.');
     } finally {
       setExportLoading(false);
+    }
+  };
+
+  // Export (download) the already-saved MC PDF (view-only sessions).
+  const handleExportMc = async () => {
+    setExportMcLoading(true);
+    try {
+      const data = await screeningsAPI.downloadMcPdf(sessionId);
+      const pdfBlob = new Blob([data], { type: 'application/pdf' });
+      const url = URL.createObjectURL(pdfBlob);
+      const safeName = patientName.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      const now = new Date();
+      const stamp = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+      const fileName = `${safeName}_${stamp}_MC.pdf`;
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error('Failed to export MC.');
+    } finally {
+      setExportMcLoading(false);
     }
   };
 
@@ -1036,7 +1145,7 @@ function ReviewView({
       {/* Generate button */}
       <div className="flex flex-col items-center mb-6">
         <button onClick={handleRAG} disabled={isLocked || !hasResults || ragLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#7c3aed', boxShadow: '0 8px 28px rgba(124,58,237,0.45)' }}>
-          🧠 {ragLoading ? 'Generating…' : 'Generate Clinical Report Summary'}
+          {ragLoading ? 'Generating…' : 'Generate Clinical Report Summary'}
         </button>
         {!hasResults && <p className="mt-2 text-sm text-gray-500 text-center">AI results are required before generating a summary.</p>}
         {hasResults && !isLocked && !ragResult && <p className="mt-2 text-sm text-gray-500 text-center">Generate this Report Summary to unlock Approve and Override (edit) options.</p>}
@@ -1086,9 +1195,27 @@ function ReviewView({
           </div>
           <p className="text-sm text-gray-600 mb-4">Clinical summary needs regeneration after the diagnosis edit.</p>
           <button onClick={handleRAG} disabled={ragLoading || isLocked || !hasResults} className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-40 cursor-pointer hover:brightness-110 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]" style={{ background: '#7c3aed', boxShadow: '0 6px 20px rgba(124,58,237,0.35)' }}>
-            🧠 {ragLoading ? 'Regenerating…' : 'Regenerate Clinical Summary'}
+            {ragLoading ? 'Regenerating…' : 'Regenerate Clinical Summary'}
           </button>
         </div>
+      )}
+
+      {(ragResult || isLocked) && (
+        <DoctorClinicalAssessment
+          value={isLocked ? savedAssessment : assessment}
+          onChange={handleAssessmentChange}
+          leftCondition={resolveCondition(leftRes)}
+          rightCondition={resolveCondition(rightRes)}
+          enabled={!!ragResult && !isLocked}
+          readOnly={isLocked}
+          mcReadOnly={mcRow ? {
+            mc_number: mcRow.mc_number as number | string | undefined,
+            days: mcRow.days as number | undefined,
+            date_from: mcRow.date_from as string | undefined,
+            date_to: mcRow.date_to as string | undefined,
+            reason: mcRow.reason as string | undefined,
+          } : null}
+        />
       )}
 
       {(ragResult !== null || isLocked) && (
@@ -1104,14 +1231,19 @@ function ReviewView({
                 <button onClick={handleExportPdf} disabled={exportLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 cursor-pointer transition-all duration-200 hover:-translate-y-1 active:translate-y-0" style={{ boxShadow: '0 8px 24px rgba(0,0,0,0.08)' }}>
                   <Download size={16} /> {exportLoading ? 'Exporting…' : 'Export as PDF'}
                 </button>
+                {mcRow && (
+                  <button onClick={handleExportMc} disabled={exportMcLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50 cursor-pointer transition-all duration-200 hover:-translate-y-1 active:translate-y-0" style={{ boxShadow: '0 8px 24px rgba(0,0,0,0.08)' }}>
+                    <Download size={16} /> {exportMcLoading ? 'Exporting…' : 'Export MC as PDF'}
+                  </button>
+                )}
               </>
             ) : (leftEdited || rightEdited || reportEdited) ? (
-              <button onClick={handleSubmit} disabled={!hasResults || flowLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
-                ✅ Approve
+              <button onClick={handleSubmit} disabled={!hasResults || flowLoading || !!assessmentError} title={assessmentError ?? undefined} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
+                Approve
               </button>
             ) : (
-              <button onClick={handleApprove} disabled={!hasResults || flowLoading} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
-                ✅ Approve
+              <button onClick={handleApprove} disabled={!hasResults || flowLoading || !!assessmentError} title={assessmentError ?? undefined} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white bg-green-500 hover:bg-green-600 disabled:opacity-40 cursor-pointer transition-all duration-200 hover:brightness-110 hover:scale-[1.02] active:scale-[0.98]" style={{ boxShadow: '0 8px 24px rgba(34,197,94,0.45)' }}>
+                Approve
               </button>
             )}
           </div>
@@ -1162,10 +1294,45 @@ function ReviewView({
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-6 shadow-xl w-full mx-4" style={{ maxWidth: 720 }}>
             <h3 className="text-lg font-bold text-gray-900 mb-3">Report Preview</h3>
+            {mcPreviewUrl && (
+              <div className="flex gap-2 mb-3">
+                {(['report', 'mc'] as const).map(tab => (
+                  <button
+                    key={tab}
+                    onClick={() => setPreviewTab(tab)}
+                    className="px-4 py-2 rounded-xl text-sm font-semibold transition-all duration-200 cursor-pointer hover:brightness-95"
+                    style={{
+                      background: previewTab === tab ? '#2563eb' : '#f3f4f6',
+                      color: previewTab === tab ? '#fff' : '#374151',
+                      border: '1px solid ' + (previewTab === tab ? '#2563eb' : '#e5e7eb'),
+                    }}
+                  >
+                    {tab === 'report' ? 'Report' : 'Medical Certificate'}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="w-full h-[55vh] overflow-y-auto rounded-lg border border-gray-200 bg-gray-100 flex justify-center p-2">
-              {previewBlob ? (
+              {previewTab === 'mc' && mcPreviewUrl ? (
                 <Document
-                  file={previewData}
+                  file={mcPreviewUrl}
+                  loading="Loading preview…"
+                  onLoadSuccess={({ numPages }) => setMcNumPages(numPages)}
+                >
+                  {Array.from({ length: mcNumPages }, (_, i) => (
+                    <Page
+                      key={`mc_page_${i + 1}`}
+                      pageNumber={i + 1}
+                      width={640}
+                      renderTextLayer={false}
+                      renderAnnotationLayer={false}
+                      className="mb-4"
+                    />
+                  ))}
+                </Document>
+              ) : previewPdfUrl ? (
+                <Document
+                  file={previewPdfUrl}
                   loading="Loading preview…"
                   onLoadSuccess={({ numPages }) => setNumPages(numPages)}
                 >
@@ -1185,7 +1352,7 @@ function ReviewView({
               )}
             </div>
             <a
-              href={previewPdfUrl ?? ''}
+              href={(previewTab === 'mc' ? mcPreviewUrl : previewPdfUrl) ?? ''}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-block mt-2 text-sm font-semibold text-blue-600 hover:underline"
