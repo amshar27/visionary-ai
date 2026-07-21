@@ -110,8 +110,7 @@ visionary_ai/
 │       ├── types/index.ts       # TypeScript interfaces
 │       └── utils/format.ts      # Formatting helpers
 ├── upload_paper.py              # One-time script: ingest research PDFs into vector store
-├── requirements.txt
-└── CLAUDE.md                    # Full developer reference (architecture, conventions, gotchas)
+└── requirements.txt
 ```
 
 ---
@@ -152,4 +151,4 @@ pending → assigned → analysed → approved
 - Auth uses bcrypt with no JWT — the user object is stored in `localStorage` under key `visionary_user`.
 - CORS is set for `http://localhost:5173` and `http://127.0.0.1:5173`. Restart uvicorn after any CORS changes.
 - The clinical report PDF (`pdf_service.py`) renders the on-screen disclaimer in a **pisa repeating static frame**, so it prints at the bottom of every page; the same disclaimer remains visible on the on-screen AI Clinical Summary card but is stripped from the PDF body to avoid duplication.
-- Full architecture reference, database schema, API routes, UI conventions, and known issues are documented in [CLAUDE.md](./CLAUDE.md).
+
