@@ -7,12 +7,13 @@ import re
 from PIL import Image
 from torchvision import models, transforms
 from torchvision.models import ResNet152_Weights
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel as PydanticBaseModel
 from uuid import UUID
 from typing import Dict, List
 import logging
 from .db import supabase
+from .main import limiter
 from openai import OpenAI
 import os
 import tempfile
@@ -287,8 +288,15 @@ def generate_heatmap(image_tensor, original_image_pil, predicted_class_idx):
 # ======================================================
 # API ENDPOINTS
 # ======================================================
-@router.post("/analyze")
-def analyze(screening_session_id: UUID):
+def _analyze_session(screening_session_id: UUID):
+    """
+    Core analysis routine.
+
+    Kept separate from the rate-limited `/analyze` endpoint so `/reanalyze` can
+    invoke it directly. Calling the decorated endpoint in-process would fail:
+    slowapi's wrapper requires a `request` argument, and it would also consume
+    the caller's /analyze rate-limit budget.
+    """
     s = (
         supabase.table("screening_sessions")
         .select("*")
@@ -448,6 +456,12 @@ def analyze(screening_session_id: UUID):
     }
 
 
+@router.post("/analyze")
+@limiter.limit("10/minute")  # model inference + Grad-CAM: expensive
+def analyze(request: Request, screening_session_id: UUID):
+    return _analyze_session(screening_session_id)
+
+
 @router.get("/results/by-session/{screening_session_id}")
 def get_results_by_session(screening_session_id: UUID):
     try:
@@ -539,7 +553,7 @@ def reanalyze(screening_session_id: UUID):
     if not s.data:
         raise HTTPException(status_code=404, detail="Screening session not found")
 
-    return analyze(screening_session_id)
+    return _analyze_session(screening_session_id)
 
 
 # ======================================================
@@ -998,7 +1012,8 @@ Guideline text:
 
 
 @router.post("/summarise-rag-crew")
-def generate_rag_summary_crew(screening_session_id: UUID):
+@limiter.limit("5/minute")  # multi-agent LLM pipeline: expensive (gpt-4o)
+def generate_rag_summary_crew(request: Request, screening_session_id: UUID):
     """
     Multi-agent version of /summarise-rag using CrewAI.
     Same input/output contract as /summarise-rag.

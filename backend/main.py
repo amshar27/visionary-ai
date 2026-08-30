@@ -3,6 +3,25 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+# -------------------------------------------------
+# Rate limiter (defined BEFORE the router imports below)
+#
+# Router modules do `from .main import limiter`. Because `limiter` is bound
+# here -- above the router imports -- `backend.main` is already in sys.modules
+# with the attribute set by the time those modules are imported, so the
+# circular import resolves. Do NOT move this below the router imports.
+#
+# `default_limits` applies 60/minute to every route via SlowAPIMiddleware.
+# Routes carrying an explicit @limiter.limit(...) decorator override it
+# (slowapi's `override_defaults` is True by default).
+# -------------------------------------------------
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+
 # -------------------------------------------------
 # Routers
 # -------------------------------------------------
@@ -28,11 +47,25 @@ from .db import supabase
 app = FastAPI(title="Visionary AI Backend")
 
 # -------------------------------------------------
+# Wire the limiter into the app
+# -------------------------------------------------
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# -------------------------------------------------
 # CORS configuration (for React frontend on Vite dev server)
+#
+# NOTE: "https://visionary-ai.vercel.app" is a PLACEHOLDER. Replace it with the
+# real Vercel production domain once the frontend is deployed. Vercel preview
+# deployments get their own per-branch URLs and are NOT covered here -- add them
+# explicitly if you need them. CORS middleware is not hot-reloaded: any change
+# to this list requires a full uvicorn restart / Railway redeploy.
 # -------------------------------------------------
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://visionary-ai.vercel.app",
 ]
 
 app.add_middleware(

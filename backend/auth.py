@@ -1,9 +1,10 @@
 # backend/auth.py
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
 from .db import supabase
 from .auth_utils import hash_password, verify_password
+from .main import limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -44,7 +45,8 @@ class RegisterResponse(BaseModel):
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(data: LoginRequest):
+@limiter.limit("5/minute")  # brute-force protection
+def login(request: Request, data: LoginRequest):
     email = (data.email or "").strip().lower()
     password = (data.password or "").strip()
 

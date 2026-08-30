@@ -12,12 +12,13 @@
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from .db import supabase
 from .auth_utils import hash_password, verify_password
 from .notification_service import send_otp_email
+from .main import limiter
 
 router = APIRouter(prefix="/auth", tags=["auth-reset"])
 
@@ -39,7 +40,8 @@ class ResetPasswordRequest(BaseModel):
 # ─── POST /auth/forgot-password ──────────────────────────────────────────────
 
 @router.post("/forgot-password")
-def forgot_password(body: ForgotPasswordRequest):
+@limiter.limit("3/minute")  # OTP spam protection
+def forgot_password(request: Request, body: ForgotPasswordRequest):
     email = body.email.strip().lower()
     safe_msg = "If this email is registered, an OTP has been sent."
 
@@ -77,7 +79,8 @@ def forgot_password(body: ForgotPasswordRequest):
 # ─── POST /auth/verify-otp ───────────────────────────────────────────────────
 
 @router.post("/verify-otp")
-def verify_otp_endpoint(body: VerifyOtpRequest):
+@limiter.limit("5/minute")  # OTP brute-force protection
+def verify_otp_endpoint(request: Request, body: VerifyOtpRequest):
     email = body.email.strip().lower()
     otp_code = body.otp_code.strip()
 
