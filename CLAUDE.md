@@ -10,8 +10,8 @@ Clinical-grade eye disease screening system built as a Final Year Project for Ma
 |---|---|
 | Backend API | FastAPI (Python), run via uvicorn |
 | Frontend | React + TypeScript (Vite), port 5173 |
-| Database | Supabase (PostgreSQL) |
-| Storage | Supabase Storage (buckets: `retinal-scans`, `guidelines`, `reports`, `medical-certificates`) |
+| Database | Supabase (PostgreSQL) — RLS deny-by-default on all 11 tables; backend connects with the service role, which bypasses it (see "Row Level Security (implemented)") |
+| Storage | Supabase Storage (buckets: `retinal-scans`, `guidelines`, `reports`, `medical-certificates`). Backend reads via service role / 1-hour signed URLs — `backend/storage_utils.py`. **The buckets are still public until flipped by hand.** |
 | AI Model | PyTorch — ResNetWithAttention (ResNet152 + MultiheadAttention) |
 | AI Explainability | Grad-CAM heatmaps via `pytorch-grad-cam` |
 | LLM (summaries) | OpenAI `gpt-4o-mini` |
@@ -149,6 +149,12 @@ No changes needed — already a managed hosted service (DB + Storage buckets: `r
 - [ ] Verify the Railway build completes within plan limits given the PyTorch/CrewAI/RAGAS dependency footprint (see §2)
 - [ ] Redeploy Railway after any CORS/env change — middleware and env vars are not hot-reloaded
 
+**Database / storage hardening (code is done; these are hand-run steps):**
+- [ ] Run `supabase/migrations/20260831000000_enable_rls_deny_by_default.sql` in the Supabase SQL editor (sections 0–5). Safe to run at any time — it does not change app behaviour.
+- [ ] Read section 0b's output to see whether `match_documents` is SECURITY DEFINER (recorded for the write-up; the revoke covers both cases either way)
+- [ ] Verify with section 7 (`pg_tables.rowsecurity`, `pg_policies`, `role_table_grants`) and the anon-key `curl` test at the bottom of the migration
+- [ ] **Only after** the storage code changes are deployed and verified: flip the buckets private, one at a time, in this order — `guidelines` (zero risk) → `retinal-scans` → `reports` + `medical-certificates`. Section 6 of the migration, or the dashboard toggle. **Do not flip before the code is live** or AI analysis, report resend, and both PDF exports break.
+
 ### Security hardening (implemented)
 
 **Rate limiting — `slowapi`.** The limiter is created in `backend/main.py`:
@@ -192,7 +198,7 @@ These are **known, unfixed** gaps. They were deliberately left out of this pass 
 
 - **No real authentication or session security.** `POST /auth/login` returns a bare user object with **no JWT, no session token, and no cookie**; the frontend stores it in `localStorage` under `visionary_user`. Consequences: any XSS on the frontend can read the whole user object; there is nothing to expire or revoke, so a "session" lasts until the user clears storage; and logout is purely client-side.
 - **Endpoints are effectively unauthenticated.** Identity is passed as ordinary request data (`created_by`, `doctor_id`, `requester_role`) that the client fully controls. Admin routes call `assert_admin()` against a **client-supplied `requester_role`**, so anyone can send `requester_role=admin` and pass the check. There is no middleware-level auth and no server-side verification that a caller is who they claim to be. Rate limiting slows abuse; it does not prevent it.
-- **Service-role backend — RLS is defence-in-depth, not request-level protection.** `backend/db.py` still uses `SUPABASE_SERVICE_ROLE_KEY`, which **bypasses Row Level Security** entirely, and that is deliberate. RLS is now enabled deny-by-default on all 11 tables (see "Row Level Security" below), but because the backend holds the service role, **every DB read/write still runs with full privileges** and the API layer remains the *only* thing standing between a request and the whole database — and per the point above, that layer does not authenticate callers. What RLS buys is containment if the **anon key** is ever leaked, committed, or used by a future frontend; it does not narrow what the backend itself can do, and it fixes nothing about the client-supplied-identity problem.
+- **Service-role backend — RLS is defence-in-depth, not request-level protection.** `backend/db.py` still uses `SUPABASE_SERVICE_ROLE_KEY`, which **bypasses Row Level Security** entirely, and that is deliberate. RLS is now enabled deny-by-default on all 11 tables (see "Row Level Security (implemented)" below), but because the backend holds the service role, **every DB read/write still runs with full privileges** and the API layer remains the *only* thing standing between a request and the whole database — and per the point above, that layer does not authenticate callers. What RLS buys is containment if the **anon key** is ever leaked, committed, or used by a future frontend; it does not narrow what the backend itself can do, and it fixes nothing about the client-supplied-identity problem.
 - **Rate limiting is in-memory and per-instance.** slowapi defaults to in-process storage, so counters **reset on every restart/redeploy** and are **not shared across instances**. Combined with the APScheduler single-instance requirement (see "Known risks"), keep Railway at one replica; a multi-instance deploy would multiply every limit by the replica count. A shared Redis backend would be needed for real enforcement.
 - **`get_remote_address` trusts the peer IP.** Behind Railway's proxy this may resolve to the proxy rather than the true client, which can cause either over-blocking (all users sharing one bucket) or under-blocking. Proper handling needs `X-Forwarded-For` parsing with a trusted-proxy configuration.
 - **Uploads are not scanned or re-encoded.** Magic-byte validation confirms a file *starts* like a JPEG/PNG; it does not prove the rest is well-formed, and no malware scanning or image re-encoding is performed. (Bucket exposure is handled separately — see "Storage: private buckets + signed URLs" below. Until those buckets are actually flipped private, retinal scan and report URLs remain readable by anyone holding the link.)
@@ -238,11 +244,22 @@ Backend read paths no longer depend on buckets being public. **The four buckets 
 
 `guidelines` is the safe one to flip first: `/ai/ingest-research` already reads it with the service-role client, so nothing breaks.
 
+**What was verified when this landed** (buckets still public at the time):
+- Signed URLs resolve on a public bucket (HTTP 200) — this is what makes "deploy the code first, flip the toggle second" safe.
+- Every derived path matches the stored URLs on real rows: `heatmaps/heatmap_{sid}_{eye}.jpg`, `{session_id}.pdf`, `{mc_id}.pdf` — all downloaded successfully through the service role.
+- Endpoint pass through the real app: `/uploads/retinal/by-session/{id}` and `/ai/results/by-session/{id}` return signed URLs with **no** `/object/public/` links left; `report-pdf` and `mc-pdf` return real `%PDF` bytes; missing-report and missing-MC still 404.
+- `load_retinal_image` exercised on all three branches (path present / legacy URL only / neither → clean `HTTPException`).
+
+**Not yet verified end-to-end:** the write paths — a full nurse upload → analyse → doctor approve-with-signature → email run. Worth doing before a demo, since testing it creates live patient rows and sends real email.
+
 ### Known risks
 - **Cold-start latency (free tier):** Railway's free/hobby tier can idle/sleep a service after inactivity; the next request pays a cold-start penalty — worse here because startup also loads the PyTorch model into memory. **Send a warm-up request to the backend (e.g. `GET /` or `GET /ai/health`) a few minutes before any live demo** to force the container awake and the model loaded, rather than eating the delay live.
 - **APScheduler + multiple instances:** if Railway ever scales the backend to more than one instance, `send_reminders()`/`auto_no_show()` would run redundantly per instance (duplicate emails, duplicate status updates) since the scheduler has no distributed lock. Keep the Railway service at a single instance/replica.
 - **CORS/env drift:** the Vercel preview-deployment URL (per-PR/per-branch) differs from the production domain; only the production Vercel domain is covered by the checklist above — preview deployments will hit CORS errors against Railway unless separately allow-listed.
 - **Secrets exposure:** `VITE_*` env vars are bundled into the client JS at build time and are publicly visible — never put a service-role key or `OPENAI_API_KEY` behind a `VITE_` prefix; only `VITE_API_URL` (a public URL) belongs on the frontend.
+- **Signed URLs expire after 1 hour (`SIGNED_URL_TTL_SECONDS`).** URLs are minted per API response, so a normal page load is unaffected. The edge case is a review tab left open past the TTL that then re-requests an image (a React re-mount or cache miss) — the URL held in component state is stale and the image fails to load. A refresh re-fetches and fixes it. Raising the TTL trades this away against longer-lived leaked links; there is no refresh-on-expiry logic.
+- **Signed URLs are unauthenticated bearer links for their lifetime.** Anyone the URL is forwarded to can open that retinal scan or report until it expires — better than a permanent public URL, but not access control. Real per-user authorisation needs the auth work described under "Security limitations".
+- **RLS does not protect against a leaked service-role key.** `SUPABASE_SERVICE_ROLE_KEY` bypasses every policy in the migration. It must stay server-side only (Railway variables, never a `VITE_` var, never committed) — with it, the deny-by-default policies are irrelevant.
 
 ---
 
@@ -376,13 +393,15 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `POST /screenings/{id}/send-report` — converts markdown report to HTML, emails patient via Resend (legacy/manual send; the signature flow below now persists + emails the PDF instead, and the review UI no longer calls this)
 - `DELETE /screenings/{id}` — only deletes pending sessions with no uploads and no assigned doctor
 
+**Module-level helper — `_fetch_stored_pdf(bucket, stored_url, fallback_path, what) -> bytes`.** Reads an already-saved PDF back out of Storage with the service-role client. Prefers the path parsed out of the stored public URL (`path_from_public_url`), falling back to the deterministic object path these buckets are written with (`{session_id}.pdf` for reports, `{mc_id}.pdf` for MCs). Raises `HTTPException(502)` on failure. Replaced the three `requests.get(public_url)` calls that broke the moment a bucket went private — **use this, not `requests.get`, for any new stored-PDF read.**
+
 **Doctor-signature PDF flow** (paths sit under the `/screenings` router prefix → `/screenings/sessions/...`):
 - `POST /screenings/sessions/{session_id}/report-preview` — body `{report_markdown, signature_data_url, patient_name, doctor_name?, physical_exam?, prescription?, clinical_impression?, management_plan?, follow_up_interval?}`. Calls `generate_report_pdf(...)` (passing the assessment fields through) and **streams the PDF back** (`application/pdf`, `Content-Disposition: inline; filename="preview.pdf"`). **No DB writes** — preview only. The preview renders the **full combined PDF** (AI body + Doctor's Clinical Assessment section) so it matches the finalized output exactly.
 - `POST /screenings/sessions/{session_id}/mc-preview` — body `{patient_name, ic_passport?, days?, date_from?, date_to?, reason?, signature_data_url, doctor_name?}`. Streams an MC PDF (`application/pdf`, `inline; filename="mc_preview.pdf"`) for the preview modal. **Option A: NO DB writes** — uses a placeholder `certificate_no = "PREVIEW"` (the real 5-digit number is only stamped at finalize) and a KL-local `mc_date` (same rule as finalize). Mirrors `report-preview`. `ic_passport` is passed from the client if available (cosmetic only); finalize still does its own server-side `ic_passport` lookup. Does **not** touch `mc_certificates`.
 - `POST /screenings/sessions/{session_id}/finalize-review` — the **only commit** of the signed flow. Body: `{doctor_id, decision, override_reason?, final_grade_left?, final_grade_right?, report_markdown, signature_data_url, patient_name, patient_email?, doctor_name?, send_to_patient, physical_exam?, prescription?, clinical_impression?, management_plan?, follow_up_interval?, mc_issue, mc_days?, mc_date_from?, mc_date_to?, mc_reason?}`. Steps: (1) `generate_report_pdf` (with the assessment fields); (2) upload to the `reports` bucket at `{session_id}.pdf` (upsert; public URL captured as `report_url`); (3) update session `status = decision`; (4) insert a `doctor_reviews` row (same shape as `doctor-review` + `report_url` + the five assessment columns `physical_exam`/`prescription`/`clinical_impression`/`management_plan`/`follow_up_interval`); (5) **Medical Certificate (gated on `mc_issue`)**: resolve `patient_id` → patient `name`/`ic_passport` from the DB (never trust the client), insert an `mc_certificates` row first to obtain the serial `mc_number` + `id`, build `certificate_no = f"{mc_number:05d}"` and a **KL-local** `mc_date` (`ZoneInfo("Asia/Kuala_Lumpur")`, never naive), call `generate_mc_pdf(...)`, upload to the `medical-certificates` bucket at `{mc_id}.pdf` (upsert), then `UPDATE` the row's `mc_url`; MC failures raise a clear `HTTPException` inside the one finalize try/except; (6) if `send_to_patient` **and** `patient_email`, send **one** email via `send_clinical_report(..., attachments=[...])` — report PDF always (filename `{name}_{stamp}_report.pdf`), plus the MC PDF when issued (`{name}_{stamp}_MC.pdf`). Returns `{success, report_url, emailed, mc_url}` (`mc_url` is `null` when no MC).
 - `GET /screenings/sessions/{session_id}/mc-certificate/latest` — returns the latest `mc_certificates` row for the session (most recent `created_at`) or `null`. Read-only; backs the doctor review screen's MC display via `screeningsAPI.getLatestMc`.
 - `POST /screenings/sessions/{session_id}/resend-report` — body `{patient_name, patient_email}`. Re-emails the **already-saved** PDF: reads the latest `doctor_reviews.report_url`, downloads the bytes via `_fetch_stored_pdf` (service-role Storage read — private-bucket safe), calls `send_clinical_report(..., pdf_bytes=...)`. 404 if no saved report/`report_url`; 502 if the download fails. Returns `{success: true}`. No regeneration, no new signature.
-- `GET /screenings/sessions/{session_id}/report-pdf` — downloads the already-saved PDF (latest `doctor_reviews.report_url`) as a `StreamingResponse` (`application/pdf`, `attachment; filename="report_{session_id}.pdf"`). 404 if none. Backs the doctor "Export as PDF" button on view-only sessions.
+- `GET /screenings/sessions/{session_id}/report-pdf` — downloads the already-saved PDF (latest `doctor_reviews.report_url`, fetched via `_fetch_stored_pdf` with the `{session_id}.pdf` object path as fallback) as a `StreamingResponse` (`application/pdf`, `attachment; filename="report_{session_id}.pdf"`). 404 if none; 502 if the storage read fails. Backs the doctor "Export as PDF" button on view-only sessions.
 - `GET /screenings/sessions/{session_id}/mc-pdf` — downloads the already-saved MC PDF (latest `mc_certificates` row; selects `id,mc_url` and fetches via `_fetch_stored_pdf`, falling back to the `{mc_id}.pdf` object path) as a `StreamingResponse` (`application/pdf`, `attachment; filename="mc_{session_id}.pdf"`). 404 if no MC; 502 if the download fails. Mirrors `report-pdf`. Backs the doctor "Export MC as PDF" button on view-only sessions (shown only when an MC exists).
 
 ### `uploads.py` — `/uploads`
@@ -706,7 +725,16 @@ Both critics emit `{verdict, failed_checks, revision_instruction}`. A revision l
 This bug is now **FIXED** in both pipelines. Previously the original `generate_rag_summary` read the glaucoma/IOP patient fields under the wrong column names (`family_history_glaucoma` / `elevated_iop`), so the RAG report always showed "Unknown" for them. The CrewAI `patient_context` tool (`backend/agents/tools/patient_context.py`) now correctly reads `glaucoma_family_history` and `elevated_iop_history` from the `patients` table.
 
 ### `RetinalImage.created_at` vs `uploaded_at`
-The `retinal_images` table column is `uploaded_at` (set in `uploads.py:82`). The TypeScript `RetinalImage` interface declares `created_at: string` instead. Read defensively if you need the timestamp from this row.
+The `retinal_images` table column is `uploaded_at` (set in `uploads.py:151`). The TypeScript `RetinalImage` interface declares `created_at: string` instead. Read defensively if you need the timestamp from this row.
+
+### Stored URL columns are stale by design — never render or fetch them directly
+`retinal_images.image_url`, `ai_results.heatmap_url`, `doctor_reviews.report_url`, and `mc_certificates.mc_url` all still hold the **public** URL written at upload time. Those are kept deliberately, as stable identifiers that `path_from_public_url()` parses — but they are **historical records, not live links**, and they stop resolving the moment their bucket is private.
+
+Every read path re-derives a working URL instead:
+- serving a URL to the frontend → `signed_url(bucket, path)` from `backend/storage_utils.py`
+- fetching bytes server-side → `download_bytes(bucket, path)`, or `_fetch_stored_pdf(...)` in `screenings.py`
+
+New code that does `<img src={row.image_url}>` or `requests.get(row.report_url)` will appear to work today and break the instant the buckets are flipped. This is the single easiest mistake to make in this codebase now.
 
 ### Frontend coverage gaps
 - `aiAPI` does **not** expose `/ai/evaluate-rag` or `/ai/rag-trace` — these are backend-only / FYP-evaluation endpoints called via direct HTTP (e.g. curl or test scripts), not from the React app.
@@ -765,6 +793,9 @@ Exceptions to the wrapper pattern:
 - **Model is global state in `ai.py`** — loaded once at import time. If load fails, a warning is logged but the server starts. The `/ai/analyze` endpoint checks `if model is None` and returns 503.
 - **Upsert pattern** — both `retinal_images` and `ai_results` use upsert (not insert) to allow re-upload and re-analysis without creating duplicate rows. Both require unique constraints in the DB: `(screening_session_id, eye_side)` and `(screening_session_id, eye)` respectively.
 - **Scheduler is always running** — `start_scheduler()` is called on every uvicorn startup event. The jobs poll every 1 minute. This is fine in dev but uses a persistent background thread.
+- **All Storage access goes through `backend/storage_utils.py`** — `signed_url()` to hand a URL to the frontend, `download_bytes()` to read a file server-side. Never `get_public_url()` on a read path and never `requests.get()` on a stored URL column; both work today and break when the buckets are flipped private. Writes may still store the public URL as a stable identifier. See "Stored URL columns are stale by design".
+- **SQL in `supabase/migrations/` is never executed by code** — no migration runner is wired up, and `supabase/` is not a Supabase CLI project. Files there are written to be idempotent and pasted into the Supabase SQL editor by hand. Adding a file changes nothing until someone runs it, so never treat its contents as the live database state — verify with the queries in the file's verification section.
+- **RLS is on, and the backend does not notice** — the service role bypasses it. Do not "fix" a failing query by loosening a policy: if the backend gets a permission error, the cause is something other than RLS. Conversely, a query succeeding proves nothing about whether anon is blocked; test that with the anon key directly.
 - **No file-based frontend build step needed in dev** — `npm run dev` serves the React app directly via Vite.
 - **Tailwind CSS** is used throughout the frontend (dark theme, `bg-[#0b0f14]` is the base background color).
 - **react-hot-toast** is used for all notifications (top-right, 4s, dark styled).
