@@ -4,6 +4,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
 from uuid import UUID
 from datetime import datetime, timezone
 from .db import supabase
+from .storage_utils import signed_url
 from .main import limiter
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
@@ -161,9 +162,11 @@ async def upload_retinal_image(
 
         created = (res.data or [None])[0]
 
-        # Attach image_url for frontend
+        # Attach a signed image_url for the frontend. The column keeps the
+        # public URL written above as a stable historical record; every read
+        # path re-signs from image_path instead.
         if created and created.get("image_path"):
-            created["image_url"] = supabase.storage.from_(BUCKET).get_public_url(created["image_path"])
+            created["image_url"] = signed_url(BUCKET, created["image_path"])
 
         # 3) Best-effort delete old storage object (only if it existed and differs)
         if old_path and old_path != path:
@@ -184,7 +187,14 @@ async def upload_retinal_image(
 @router.get("/retinal/by-session/{screening_session_id}")
 def list_retinal_images(screening_session_id: UUID):
     """
-    List retinal images for a screening session + include public image_url.
+    List retinal images for a screening session + a fresh signed image_url.
+
+    The URL is recomputed from `image_path` on every read rather than served
+    from the stored `image_url` column, so this single endpoint keeps every
+    retinal image in the app working once the bucket is private — the nurse
+    session view and the doctor's EyePanel both just render what they are
+    given. Links expire (see SIGNED_URL_TTL_SECONDS).
+
     With the UNIQUE constraint + UPSERT, this should return at most 2 rows (left/right).
     """
     try:
@@ -198,10 +208,9 @@ def list_retinal_images(screening_session_id: UUID):
 
         rows = res.data or []
 
-        storage = supabase.storage.from_(BUCKET)
         for r in rows:
             path = r.get("image_path")
-            r["image_url"] = storage.get_public_url(path) if path else None
+            r["image_url"] = signed_url(BUCKET, path) if path else None
 
         return {"ok": True, "data": rows}
 

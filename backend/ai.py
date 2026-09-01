@@ -13,6 +13,12 @@ from uuid import UUID
 from typing import Dict, List
 import logging
 from .db import supabase
+from .storage_utils import (
+    RETINAL_BUCKET,
+    download_bytes,
+    path_from_public_url,
+    signed_url,
+)
 from .main import limiter
 from openai import OpenAI
 import os
@@ -154,6 +160,12 @@ except Exception as e:
 # HELPER FUNCTIONS
 # ======================================================
 def download_image_from_supabase(image_url: str) -> Image.Image:
+    """Legacy fallback: fetch a retinal scan over its public URL.
+
+    Only reachable for rows whose `image_path` is missing AND whose stored
+    `image_url` does not parse (see `load_retinal_image`). Breaks once the
+    bucket is private, which is intended — it should not be the live path.
+    """
     try:
         response = requests.get(image_url, timeout=30)
         response.raise_for_status()
@@ -162,6 +174,30 @@ def download_image_from_supabase(image_url: str) -> Image.Image:
     except Exception as e:
         logger.error(f"Failed to download image from {image_url}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to download image: {e}")
+
+
+def load_retinal_image(image_path: str | None, image_url: str | None) -> Image.Image:
+    """Load a retinal scan for inference, preferring the storage path.
+
+    Reading through the service-role client means analysis keeps working when
+    `retinal-scans` is private. Falls back to deriving the path from a stored
+    public URL (older rows), and only then to fetching that URL directly.
+    """
+    path = image_path or path_from_public_url(image_url or "", RETINAL_BUCKET)
+
+    if path:
+        try:
+            data = download_bytes(RETINAL_BUCKET, path)
+            return Image.open(io.BytesIO(data)).convert('RGB')
+        except Exception as e:
+            logger.error(f"Failed to download {RETINAL_BUCKET}/{path} from storage: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to download image: {e}")
+
+    if image_url:
+        logger.warning("Falling back to public-URL fetch; no usable storage path on this row.")
+        return download_image_from_supabase(image_url)
+
+    raise HTTPException(status_code=500, detail="Image row has neither a storage path nor a URL.")
 
 
 def predict_image(image: Image.Image) -> Dict:
@@ -317,7 +353,7 @@ def _analyze_session(screening_session_id: UUID):
 
     imgs = (
         supabase.table("retinal_images")
-        .select("eye_side, image_url, id")
+        .select("eye_side, image_url, image_path, id")
         .eq("screening_session_id", str(screening_session_id))
         .execute()
     )
@@ -340,14 +376,15 @@ def _analyze_session(screening_session_id: UUID):
     for img_record in imgs.data:
         eye_side = (img_record.get("eye_side") or "").lower()
         image_url = img_record.get("image_url")
+        image_path = img_record.get("image_path")
 
-        if not image_url:
-            logger.warning(f"No image URL for {eye_side} eye")
+        if not image_path and not image_url:
+            logger.warning(f"No image path or URL for {eye_side} eye")
             continue
 
         try:
-            logger.info(f"Processing {eye_side} eye image: {image_url}")
-            image = download_image_from_supabase(image_url)
+            logger.info(f"Processing {eye_side} eye image: {image_path or image_url}")
+            image = load_retinal_image(image_path, image_url)
 
             prediction = predict_image(image)
 
@@ -472,7 +509,22 @@ def get_results_by_session(screening_session_id: UUID):
             .order("created_at", desc=True)
             .execute()
         )
-        return {"ok": True, "data": res.data or []}
+
+        rows = res.data or []
+
+        # Re-sign heatmap links on every read so they keep working once
+        # `retinal-scans` is private. The stored `heatmap_url` becomes a
+        # historical value, not a live link. A null stays null — that means
+        # Grad-CAM generation failed for that eye, and the dashboards
+        # already fall back to the original image.
+        for r in rows:
+            if not r.get("heatmap_url"):
+                continue
+            eye = (r.get("eye") or "").lower()
+            path = f"heatmaps/heatmap_{screening_session_id}_{eye}.jpg"
+            r["heatmap_url"] = signed_url(RETINAL_BUCKET, path)
+
+        return {"ok": True, "data": rows}
     except Exception as e:
         raise HTTPException(
             status_code=500,

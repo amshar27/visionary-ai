@@ -14,6 +14,7 @@ import requests
 from .db import supabase
 from .notification_service import send_clinical_report
 from .pdf_service import generate_report_pdf, generate_mc_pdf
+from .storage_utils import download_bytes, path_from_public_url
 
 router = APIRouter(prefix="/screenings", tags=["screenings"])
 
@@ -385,6 +386,21 @@ REPORTS_BUCKET = "reports"
 MC_BUCKET = "medical-certificates"
 
 
+def _fetch_stored_pdf(bucket: str, stored_url: str, fallback_path: str, what: str) -> bytes:
+    """Read an already-saved PDF back out of Storage with the service-role client.
+
+    Replaces fetching the stored public URL over plain HTTP, which stops
+    working the moment the bucket is made private. Prefers the path parsed
+    out of the stored URL, falling back to the deterministic object path
+    these buckets are written with.
+    """
+    path = path_from_public_url(stored_url, bucket) or fallback_path
+    try:
+        return download_bytes(bucket, path)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch stored {what}: {e}")
+
+
 class ReportPreviewRequest(BaseModel):
     report_markdown: str
     signature_data_url: str
@@ -687,10 +703,7 @@ def resend_report(session_id: UUID, payload: ResendReportRequest):
             raise HTTPException(status_code=404, detail="No saved report found for this session")
 
         # 2) Download the stored PDF bytes
-        r = requests.get(report_url)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch stored report")
-        pdf_bytes = r.content
+        pdf_bytes = _fetch_stored_pdf(REPORTS_BUCKET, report_url, f"{sid}.pdf", "report")
 
         # 3) Email the saved PDF (cover-letter body; report_markdown unused now)
         ok = send_clinical_report(
@@ -735,12 +748,10 @@ def download_report_pdf(session_id: UUID):
             raise HTTPException(status_code=404, detail="No saved report found")
 
         # Download the stored PDF bytes
-        r = requests.get(report_url)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch stored report")
+        pdf_bytes = _fetch_stored_pdf(REPORTS_BUCKET, report_url, f"{sid}.pdf", "report")
 
         return StreamingResponse(
-            BytesIO(r.content),
+            BytesIO(pdf_bytes),
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="report_{sid}.pdf"'},
         )
@@ -785,7 +796,7 @@ def download_mc_pdf(session_id: UUID):
         # Latest MC row for this session
         mc_res = (
             supabase.table("mc_certificates")
-            .select("mc_url")
+            .select("id,mc_url")
             .eq("screening_session_id", sid)
             .order("created_at", desc=True)
             .limit(1)
@@ -796,13 +807,14 @@ def download_mc_pdf(session_id: UUID):
         if not mc_url:
             raise HTTPException(status_code=404, detail="No saved MC found")
 
-        # Download the stored PDF bytes
-        r = requests.get(mc_url)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch stored MC")
+        # Download the stored PDF bytes. MC objects are written at {mc_id}.pdf,
+        # so the row id is the fallback path.
+        pdf_bytes = _fetch_stored_pdf(
+            MC_BUCKET, mc_url, f"{latest.get('id')}.pdf", "MC"
+        )
 
         return StreamingResponse(
-            BytesIO(r.content),
+            BytesIO(pdf_bytes),
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="mc_{sid}.pdf"'},
         )
