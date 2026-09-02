@@ -1,5 +1,6 @@
 torch>=2.1.0
 torchvision>=0.16.0
+huggingface_hub==0.36.2
 altair==6.0.0
 annotated-doc==0.0.4
 annotated-types==0.7.0

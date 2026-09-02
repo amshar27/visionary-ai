@@ -56,7 +56,20 @@ SUPABASE_URL=...
 SUPABASE_SERVICE_ROLE_KEY=...
 OPENAI_API_KEY=...
 RESEND_API_KEY=...
+HF_TOKEN=...
+HF_MODEL_REPO=amshar05/visionary-ai-resnet152
 ```
+
+| Var | Purpose |
+|---|---|
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service-role key (`db.py`) — bypasses RLS, server-side only |
+| `OPENAI_API_KEY` | LLM summaries, RAG reports, embeddings, CrewAI agents |
+| `RESEND_API_KEY` | Transactional email (`notification_service.py`) |
+| `HF_TOKEN` | Hugging Face **read** token — authenticates the checkpoint download; required because the model repo is private |
+| `HF_MODEL_REPO` | Hugging Face repo holding `best_model.pth` (`amshar05/visionary-ai-resnet152`) |
+
+`HF_TOKEN` / `HF_MODEL_REPO` are only consulted when `backend/model/best_model.pth` is **absent** — see the `ai.py` entry under "Backend Modules". Locally the file exists, so neither is read and startup makes no network call. On Railway the file is missing (it is gitignored — 300 MB, over GitHub's 100 MB per-file limit), so both are mandatory or the backend boots without a model and `/ai/analyze` returns 503.
 
 ---
 
@@ -108,6 +121,8 @@ Vite only exposes env vars prefixed `VITE_` to client code (`import.meta.env`), 
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service-role key (`db.py`) |
 | `OPENAI_API_KEY` | Model inference LLM calls (`gpt-4o-mini`, `gpt-4o`, embeddings) + CrewAI agents |
 | `RESEND_API_KEY` | Email sending (`notification_service.py`) |
+| `HF_TOKEN` | Hugging Face read token — downloads `best_model.pth` at startup (the repo is private) |
+| `HF_MODEL_REPO` | Hugging Face repo id for the checkpoint — `amshar05/visionary-ai-resnet152` |
 
 **Start command:** Railway needs an explicit run command since there's no `Procfile` yet — e.g. `uvicorn backend.main:app --host 0.0.0.0 --port $PORT` (Railway injects `$PORT`; the local `--port 8000` default doesn't apply). Must still run from the project root so `backend/model/best_model.pth` resolves as a relative path (per the note in "Running the Project" above).
 
@@ -145,7 +160,7 @@ No changes needed — already a managed hosted service (DB + Storage buckets: `r
 - [ ] Set `VITE_API_URL` in Vercel project settings (build-time — must be set before the build)
 - [ ] Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `RESEND_API_KEY` in Railway project variables
 - [ ] Set Railway start command to bind `0.0.0.0:$PORT` and run from project root
-- [ ] Confirm `backend/model/best_model.pth` is actually present in the deployed image (large binary — check it isn't excluded by `.gitignore`/`.railwayignore` or a Git LFS issue)
+- [ ] Set `HF_TOKEN` and `HF_MODEL_REPO` in Railway project variables — `backend/model/best_model.pth` is gitignored and will **not** be in the deployed image, so the Hugging Face fallback in `load_model()` is the only source of weights there
 - [ ] Verify the Railway build completes within plan limits given the PyTorch/CrewAI/RAGAS dependency footprint (see §2)
 - [ ] Redeploy Railway after any CORS/env change — middleware and env vars are not hot-reloaded
 
@@ -409,6 +424,9 @@ bcrypt `hash_password(plain)` and `verify_password(plain, hashed)`.
 - `GET /uploads/retinal/by-session/{id}` — lists images for session (max 2: left + right). Recomputes `image_url` from `image_path` on every read as a **signed** URL (overwrites the stored value). This single call is what keeps every retinal image working once the bucket is private.
 
 ### `ai.py` — `/ai`
+
+**Checkpoint resolution — `resolve_checkpoint_path()` / `load_model()`.** `load_model()` no longer hard-codes `backend/model/best_model.pth`. It calls `resolve_checkpoint_path()`, which resolves in three tiers: (1) the local file `backend/model/best_model.pth` if it exists — the dev source of truth, no network call; (2) otherwise `huggingface_hub.hf_hub_download(repo_id=$HF_MODEL_REPO, filename="best_model.pth", token=$HF_TOKEN)`, which caches into huggingface_hub's **default** cache (`~/.cache/huggingface`) — nothing is ever written into `backend/model/`, so cached downloads never mix with the local checkpoint; (3) if neither is available it raises a `RuntimeError` naming both env vars and the expected local path, so a deploy failure is diagnosable from the first log line. On Railway the cache is ephemeral and a cold start re-downloads (~15–30s for 300 MB) — acceptable, and **no persistent volume is used or required**. The startup call keeps the pre-existing contract (server still boots, `/ai/analyze` returns 503) but now logs at **CRITICAL**, not `warning`. Both env vars are read from the environment only — no token default is baked into the code. `huggingface_hub` is imported **lazily inside** `resolve_checkpoint_path()`, so the local-file path never touches it.
+
 - `POST /ai/analyze?screening_session_id=` — reads each eye's scan via `load_retinal_image(image_path, image_url)` (service-role Storage download, so it works on a private bucket; falls back to parsing the path out of a legacy stored URL, then to a direct URL fetch). Runs model on both eyes, generates Grad-CAM, uploads heatmaps to `retinal-scans/heatmaps/`, then upserts per-eye rows (with `heatmap_url`) into `ai_results` and sets session status=analysed. Requires both left and right images. Blocked if session status is in `LOCKED_STATUSES = {assigned, approved, overridden}`. The upsert dict includes: `screening_session_id, eye, disease_detected, dr_severity, referable, confidence_score, macular_involvement, llm_summary, follow_up_interval, warnings, class_probabilities, heatmap_url`. **Not** included: `predicted_class`, `disease_type`, `severity_label` — these are only ever set via doctor override (PATCH).
 - `POST /ai/reanalyze/{id}` — bypasses lock, calls analyze. For admin/debug use. Not currently called by the frontend.
 - `GET /ai/results/by-session/{id}` — returns ai_results rows for session. **Re-signs `heatmap_url`** on every read from the deterministic path `heatmaps/heatmap_{session_id}_{eye}.jpg` (a `null` stays `null` — Grad-CAM failed for that eye — and the dashboards fall back to the original image).

@@ -140,11 +140,71 @@ class ResNetWithAttention(nn.Module):
 # ======================================================
 model = None
 
+# Local dev copy of the checkpoint. Not tracked in git (300 MB, over GitHub's
+# 100 MB per-file limit), so it is absent on any fresh clone / deploy.
+LOCAL_MODEL_PATH = "backend/model/best_model.pth"
+
+# Filename of the checkpoint inside the Hugging Face repo.
+HF_MODEL_FILENAME = "best_model.pth"
+
+
+def resolve_checkpoint_path() -> str:
+    """Locate the ResNetWithAttention checkpoint.
+
+    Resolution order:
+      1. `backend/model/best_model.pth` if it exists — the local source of
+         truth. Keeps dev startup offline with zero network calls.
+      2. Otherwise download from the private Hugging Face repo named by
+         HF_MODEL_REPO, authenticating with HF_TOKEN. `hf_hub_download`
+         caches into huggingface_hub's default location
+         (~/.cache/huggingface); nothing is written into backend/model/, so
+         cached downloads never mix with the local checkpoint. On Railway
+         that cache is ephemeral — a cold start re-downloads (~15–30s for
+         300 MB), which is acceptable since instances stay warm between
+         requests. No persistent volume is required.
+      3. Neither available → raise. The app is unusable without weights, so
+         this fails loudly rather than degrading to a null model.
+    """
+    if os.path.exists(LOCAL_MODEL_PATH):
+        logger.info(f"Checkpoint: using local file {LOCAL_MODEL_PATH}")
+        return LOCAL_MODEL_PATH
+
+    repo_id = os.getenv("HF_MODEL_REPO")
+    token = os.getenv("HF_TOKEN")
+
+    if not repo_id or not token:
+        raise RuntimeError(
+            "Model checkpoint unavailable. "
+            f"No local file at '{LOCAL_MODEL_PATH}', and the Hugging Face "
+            "fallback is not configured: "
+            f"HF_MODEL_REPO={'set' if repo_id else 'MISSING'}, "
+            f"HF_TOKEN={'set' if token else 'MISSING'}. "
+            "Set both environment variables (the repo is private, so a read "
+            f"token is required) or place the checkpoint at '{LOCAL_MODEL_PATH}'."
+        )
+
+    # Imported lazily so the local-file path stays free of huggingface_hub.
+    from huggingface_hub import hf_hub_download
+
+    logger.info(
+        f"Checkpoint: no local file at '{LOCAL_MODEL_PATH}' — downloading "
+        f"'{HF_MODEL_FILENAME}' from Hugging Face repo '{repo_id}'"
+    )
+    path = hf_hub_download(
+        repo_id=repo_id,
+        filename=HF_MODEL_FILENAME,
+        token=token,
+    )
+    logger.info(f"Checkpoint: resolved from Hugging Face cache at {path}")
+    return path
+
+
 def load_model():
     global model
     try:
+        checkpoint_path = resolve_checkpoint_path()
         model = ResNetWithAttention(num_classes=NUM_CLASSES).to(device)
-        model.load_state_dict(torch.load('backend/model/best_model.pth', map_location=device))
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         model.eval()
         logger.info("✅ Model loaded successfully")
     except Exception as e:
@@ -154,7 +214,10 @@ def load_model():
 try:
     load_model()
 except Exception as e:
-    logger.warning(f"Model not loaded on startup: {e}")
+    # Pre-existing contract: the server still boots and /ai/analyze returns 503.
+    # Logged at CRITICAL so a missing checkpoint is the first thing visible in
+    # the deploy log rather than a warning buried in startup noise.
+    logger.critical(f"❌ MODEL NOT LOADED — /ai/analyze will return 503. Cause: {e}")
 
 # ======================================================
 # HELPER FUNCTIONS
