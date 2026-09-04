@@ -5,21 +5,21 @@ import os
 from crewai import LLM
 
 researcher_llm = LLM(
-    model="gpt-4o-mini",
+    model="gpt-5.6-luna",
     temperature=0.1,
     max_tokens=1000,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
 writer_llm = LLM(
-    model="gpt-4o",
+    model="gpt-5.6-terra",
     temperature=0.3,
     max_tokens=4000,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
 critic_llm = LLM(
-    model="gpt-4o-mini",
+    model="gpt-5.6-luna",
     temperature=0.0,
     max_tokens=500,
     api_key=os.getenv("OPENAI_API_KEY"),

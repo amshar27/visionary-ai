@@ -285,7 +285,7 @@ def generate_summary(predicted_class: str, confidence: float, dr_presence: bool,
         """
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.6-luna",
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg}
@@ -1164,7 +1164,7 @@ def evaluate_rag(screening_session_id: UUID):
                 _context_metric_name = "context_precision"
 
         _ragas_metrics = [faithfulness, answer_relevancy, _context_metric]
-        _ragas_llm = LangchainLLMWrapper(LCChatOpenAI(model="gpt-4o-mini", max_tokens=4000))
+        _ragas_llm = LangchainLLMWrapper(LCChatOpenAI(model="gpt-5.6-luna", max_tokens=4000))
         _ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
         _ragas_loaded = True
         # Store Dataset in module scope so it's accessible below
