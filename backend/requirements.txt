@@ -1,5 +1,6 @@
 torch>=2.1.0
 torchvision>=0.16.0
+huggingface_hub==0.36.2
 altair==6.0.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
@@ -43,7 +44,7 @@ matplotlib==3.10.7
 multidict==6.7.0
 narwhals==2.13.0
 numpy==2.3.5
-opencv-python
+opencv-python-headless
 packaging==25.0
 pandas==2.3.3
 passlib==1.7.4
